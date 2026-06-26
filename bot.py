@@ -11,7 +11,8 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8754472585:AAHSvci8Mya7QkalHUW0Y3IybsNWB1p1uUY"
-PO_SSID = "AZ04VJAp0pn2t6jBm"
+PO_SSID = "42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]
+"
 
 OTC_PAIRS = [
     {"name": "AED/CNY OTC", "flag": "🇦🇪", "type": "otc", "symbol": "AEDCNY_otc"},
