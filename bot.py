@@ -39,7 +39,9 @@ LIVE_PAIRS = [
 
 ALL_PAIRS = OTC_PAIRS + LIVE_PAIRS
 
-# ===== Pocket Option WebSocket =====
+# ===== Pocket Option Cache =====
+po_candles_cache = {}
+po_connected = False
 
 PO_WS_REGIONS = [
     "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
@@ -47,130 +49,117 @@ PO_WS_REGIONS = [
     "wss://api-s.po.market/socket.io/?EIO=4&transport=websocket",
 ]
 
+async def po_background_connection():
+    global po_connected
+    while True:
+        for ws_url in PO_WS_REGIONS:
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    extra_headers={
+                        "Origin": "https://pocketoption.com",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    },
+                    ping_interval=25,
+                    ping_timeout=15,
+                    close_timeout=5,
+                ) as ws:
+                    await asyncio.wait_for(ws.recv(), timeout=5)
+                    await ws.send("40")
+                    await asyncio.wait_for(ws.recv(), timeout=5)
+                    await ws.send(PO_SSID)
+
+                    auth_ok = False
+                    for _ in range(10):
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=3)
+                            if "auth/success" in msg:
+                                auth_ok = True
+                                po_connected = True
+                                logger.info("✅ PO Auth Success")
+                                break
+                        except asyncio.TimeoutError:
+                            break
+
+                    if not auth_ok:
+                        continue
+
+                    # اشترك في كل الأزواج
+                    for pair in OTC_PAIRS:
+                        now_ts = int(datetime.now().timestamp())
+                        req = json.dumps(["subForHistory", {
+                            "asset": pair["symbol"],
+                            "period": 60,
+                            "time": now_ts,
+                            "index": 0,
+                        }])
+                        await ws.send(f"42{req}")
+                        await asyncio.sleep(0.3)
+
+                    # استقبال مستمر
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=30)
+
+                            if msg == "2":
+                                await ws.send("3")
+                                continue
+
+                            if msg.startswith("42"):
+                                try:
+                                    data = json.loads(msg[2:])
+                                    if isinstance(data, list) and len(data) >= 2:
+                                        payload = data[1]
+                                        if isinstance(payload, dict):
+                                            asset = payload.get("asset", "")
+                                            raw = (payload.get("candles") or
+                                                   payload.get("data") or
+                                                   payload.get("history") or [])
+                                            candles = []
+                                            for c in raw:
+                                                if isinstance(c, dict) and "open" in c:
+                                                    candles.append({
+                                                        "open": float(c.get("open", 0)),
+                                                        "close": float(c.get("close", 0)),
+                                                        "high": float(c.get("high", c.get("close", 0))),
+                                                        "low": float(c.get("low", c.get("close", 0))),
+                                                    })
+                                                elif isinstance(c, (list, tuple)) and len(c) >= 4:
+                                                    candles.append({
+                                                        "open": float(c[1]),
+                                                        "close": float(c[4]) if len(c) > 4 else float(c[3]),
+                                                        "high": float(c[2]),
+                                                        "low": float(c[3]),
+                                                    })
+                                            if candles and asset:
+                                                po_candles_cache[asset] = candles
+                                                logger.info(f"📊 Cached {len(candles)} candles for {asset}")
+                                except Exception as parse_err:
+                                    logger.warning(f"Parse error: {parse_err}")
+
+                        except asyncio.TimeoutError:
+                            try:
+                                await ws.send("3")
+                            except:
+                                break
+                            continue
+                        except Exception as e:
+                            logger.warning(f"Recv error: {e}")
+                            break
+
+            except Exception as e:
+                logger.warning(f"PO WS disconnected: {e}")
+                po_connected = False
+
+            await asyncio.sleep(5)
+
 async def fetch_po_candles(symbol: str, count: int = 80):
-    """سحب شموع OTC حقيقية من Pocket Option WebSocket"""
-    for ws_url in PO_WS_REGIONS:
-        try:
-            candles = await _connect_and_fetch(ws_url, symbol, count)
-            if candles and len(candles) >= 20:
-                logger.info(f"✅ PO WebSocket: {len(candles)} candles for {symbol}")
-                return candles
-        except Exception as e:
-            logger.warning(f"PO WS failed {ws_url}: {e}")
-            continue
+    candles = po_candles_cache.get(symbol)
+    if candles and len(candles) >= 20:
+        return candles[-count:]
     return None
 
-async def _connect_and_fetch(ws_url: str, symbol: str, count: int):
-    candles = []
-    try:
-        async with websockets.connect(
-            ws_url,
-            extra_headers={
-                "Origin": "https://pocketoption.com",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            },
-            ping_interval=20,
-            ping_timeout=10,
-            close_timeout=5,
-        ) as ws:
-            # انتظر رسالة الترحيب
-            msg = await asyncio.wait_for(ws.recv(), timeout=5)
-            logger.info(f"PO WS connected: {msg[:50]}")
-
-            # أرسل upgrade
-            await ws.send("40")
-            await asyncio.wait_for(ws.recv(), timeout=5)
-
-            # أرسل auth
-            await ws.send(PO_SSID)
-
-            # انتظر auth success
-            auth_success = False
-            for _ in range(10):
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=3)
-                    if "auth/success" in msg:
-                        auth_success = True
-                        logger.info("✅ PO Auth Success")
-                        break
-                except asyncio.TimeoutError:
-                    break
-
-            if not auth_success:
-                return None
-
-            # طلب بيانات الشموع
-            now_ts = int(datetime.now().timestamp())
-            candle_request = json.dumps([
-                "subForHistory",
-                {
-                    "asset": symbol,
-                    "period": 60,
-                    "time": now_ts,
-                    "index": 0,
-                }
-            ])
-            await ws.send(f"42{candle_request}")
-
-            # استقبال البيانات
-            for _ in range(20):
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=3)
-
-                    if "candles" in msg or "history" in msg or "loadHistoryPeriod" in msg:
-                        # تحليل البيانات
-                        if msg.startswith("42"):
-                            data = json.loads(msg[2:])
-                            if isinstance(data, list) and len(data) >= 2:
-                                payload = data[1]
-
-                                # شكل 1: قائمة شموع مباشرة
-                                if isinstance(payload, list):
-                                    for c in payload:
-                                        if isinstance(c, dict) and "open" in c:
-                                            candles.append({
-                                                "open": float(c.get("open", 0)),
-                                                "close": float(c.get("close", 0)),
-                                                "high": float(c.get("high", c.get("close", 0))),
-                                                "low": float(c.get("low", c.get("close", 0))),
-                                            })
-
-                                # شكل 2: dict يحتوي candles
-                                elif isinstance(payload, dict):
-                                    raw = payload.get("candles") or payload.get("data") or payload.get("history") or []
-                                    for c in raw:
-                                        if isinstance(c, (list, tuple)) and len(c) >= 4:
-                                            candles.append({
-                                                "open": float(c[1]),
-                                                "close": float(c[4]) if len(c) > 4 else float(c[3]),
-                                                "high": float(c[2]),
-                                                "low": float(c[3]),
-                                            })
-                                        elif isinstance(c, dict) and "open" in c:
-                                            candles.append({
-                                                "open": float(c.get("open", 0)),
-                                                "close": float(c.get("close", 0)),
-                                                "high": float(c.get("high", c.get("close", 0))),
-                                                "low": float(c.get("low", c.get("close", 0))),
-                                            })
-
-                                if len(candles) >= 20:
-                                    break
-
-                    # keep-alive
-                    elif msg == "2":
-                        await ws.send("3")
-
-                except asyncio.TimeoutError:
-                    continue
-
-    except Exception as e:
-        logger.warning(f"WS error: {e}")
-        return None
-
-    return candles[-count:] if len(candles) >= 20 else None
-
-# ===== Yahoo Finance للأسواق الحقيقية =====
+# ===== Yahoo Finance =====
 
 async def fetch_yahoo_candles(symbol: str, count: int = 80):
     try:
@@ -262,11 +251,11 @@ def calc_williams_r(candles, period=14):
     if len(candles) < period:
         return -50.0
     recent = candles[-period:]
-    highest_high = max(c["high"] for c in recent)
-    lowest_low = min(c["low"] for c in recent)
-    if highest_high == lowest_low:
+    hh = max(c["high"] for c in recent)
+    ll = min(c["low"] for c in recent)
+    if hh == ll:
         return -50.0
-    return round(((highest_high - candles[-1]["close"]) / (highest_high - lowest_low)) * -100, 2)
+    return round(((hh - candles[-1]["close"]) / (hh - ll)) * -100, 2)
 
 def calc_cci(candles, period=20):
     if len(candles) < period:
@@ -311,7 +300,6 @@ def detect_patterns(candles):
                 abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
                 c[-1]["close"] > (c[-3]["open"] + c[-3]["close"]) / 2):
             patterns.append("🌟 Morning Star"); score += 4
-
         if (c[-3]["close"] > c[-3]["open"] and
                 abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
                 c[-1]["close"] < (c[-3]["open"] + c[-3]["close"]) / 2):
@@ -342,8 +330,8 @@ def analyze_real(candles, expiry, pair_type, data_source="smart"):
     support = round(min(c["low"] for c in candles[-20:]), 6)
     resistance = round(max(c["high"] for c in candles[-20:]), 6)
 
-    buy_score = 0
-    sell_score = 0
+    buy_score = 0.0
+    sell_score = 0.0
     signals_detail = []
 
     if rsi < 25: buy_score += 3; signals_detail.append(f"🟢 RSI Oversold ({rsi})")
@@ -419,7 +407,7 @@ def analyze_real(candles, expiry, pair_type, data_source="smart"):
     return {
         "direction": direction, "arrow": arrow, "confidence": confidence,
         "signals": signals_detail[:5], "rsi": rsi, "stoch": stoch,
-        "williams_r": wr, "cci": cci, "atr": atr, "price": current_price,
+        "wr": wr, "cci": cci, "atr": atr, "price": current_price,
         "buy_score": round(buy_score, 1), "sell_score": round(sell_score, 1),
         "source": source_labels.get(data_source, "🧠 Smart Analysis"),
     }
@@ -511,13 +499,15 @@ def find_pair(text):
 # ===== هاندلرز =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = "🟢 متصل بـ Pocket Option" if po_connected else "🧠 وضع التحليل الذكي"
     await update.message.reply_text(
-        "👋 *مرحباً في VaultFX AI Bot* 🤖\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🟢 *OTC:* بيانات Pocket Option حقيقية\n"
-        "📡 *Live:* بيانات Yahoo Finance حقيقية\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "اختر نوع السوق:",
+        f"👋 *مرحباً في VaultFX AI Bot* 🤖\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📡 *الحالة:* {status}\n"
+        f"🟢 *OTC:* بيانات Pocket Option حقيقية\n"
+        f"📡 *Live:* بيانات Yahoo Finance حقيقية\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"اختر نوع السوق:",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
@@ -563,29 +553,38 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
     )
 
     steps = [
-        "🟢 *جاري الاتصال بـ Pocket Option...*" if pair_type == "otc" else "📡 *جاري سحب البيانات...*",
+        "🟢 *جاري سحب بيانات OTC...*" if pair_type == "otc" else "📡 *جاري سحب البيانات...*",
         "📊 *تحليل RSI · EMA · MACD...*",
         "🔥 *فحص Williams%R · CCI · ATR...*",
         "🎯 *توليد الإشارة النهائية...*",
     ]
 
-    # بدء سحب البيانات بالتوازي
-    if pair_type == "otc":
-        candles_task = asyncio.create_task(fetch_po_candles(pair["symbol"], 80))
-    else:
+    if pair_type == "live":
         candles_task = asyncio.create_task(fetch_yahoo_candles(pair["symbol"], 80))
+    else:
+        candles_task = None
 
     for step in steps:
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.8)
         try:
             await scan_msg.edit_text(step, parse_mode="Markdown")
         except:
             pass
 
-    candles = await candles_task
+    candles = None
+    data_source = "smart"
+
+    if pair_type == "otc":
+        candles = await fetch_po_candles(pair["symbol"], 80)
+        if candles and len(candles) >= 20:
+            data_source = "pocket_option"
+    else:
+        if candles_task:
+            candles = await candles_task
+            if candles and len(candles) >= 20:
+                data_source = "yahoo"
 
     if candles and len(candles) >= 20:
-        data_source = "pocket_option" if pair_type == "otc" else "yahoo"
         result = analyze_real(candles, expiry, pair_type, data_source=data_source)
     else:
         result = analyze_smart(pair_name, expiry, pair_type)
@@ -623,12 +622,15 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
         reply_markup=keyboard
     )
 
+async def post_init(application):
+    asyncio.create_task(po_background_connection())
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_expiry_selection, pattern="^expiry\\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 VaultFX AI Bot v4 — Pocket Option WebSocket Active")
+    print("🤖 VaultFX AI Bot v5 — Live OTC Connection")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
