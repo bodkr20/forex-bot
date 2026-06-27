@@ -13,7 +13,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8754472585:AAGIX510vMHTRCTJaGVdnsjn8HjcPqq9-HQ"
-PO_SSID = '42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]'
+
+# ✅ SSID الجديد المستخرج من ci_session
+PO_SSID = '42["auth",{"sessionToken":"aed3356f10d74157d08066c4731a3205","uid":"130213513","lang":"en"}]'
 
 OTC_PAIRS = [
     {"name": "AED/CNY OTC", "flag": "🇦🇪", "type": "otc", "symbol": "AEDCNY_otc"},
@@ -94,14 +96,12 @@ async def _connect_and_fetch(ws_url: str, symbol: str, count: int):
 
             now_ts = int(datetime.now().timestamp())
             
-            # ✅ صيغة جديدة للاشتراك
             subscribe_msg = json.dumps([
                 "subscribe",
                 {"asset": symbol, "period": 60}
             ])
             await ws.send(f"42{subscribe_msg}")
             
-            # ✅ صيغة جديدة لطلب التاريخ
             history_msg = json.dumps([
                 "loadHistoryPeriod",
                 {"asset": symbol, "period": 60, "time": now_ts, "index": 0}
@@ -937,26 +937,14 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
 
     candles = await candles_task
 
+    # ✅ التعديل الأساسي - إذا ما فيه بيانات، روح للتحليل الذكي
     if pair_type == "otc":
         if candles and len(candles) >= 20:
             result = analyze_otc_pro(candles, expiry)
         else:
-            await scan_msg.delete()
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=(
-                    f"⚠️ *لا توجد بيانات حقيقية كافية*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"💱 {pair['flag']} *{pair_name}*\n"
-                    f"📊 *البيانات:* {len(candles) if candles else 0} شمعة\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"❌ *لا يمكن إعطاء إشارة بدون بيانات حقيقية*\n"
-                    f"🔄 حاول بعد قليل"
-                ),
-                parse_mode="Markdown",
-                reply_markup=get_otc_keyboard()
-            )
-            return
+            logger.info(f"⚠️ No real data for {pair_name}, using Smart Analysis")
+            result = analyze_smart(pair_name, expiry, pair_type)
+            result["source"] = "🧠 Smart Analysis (تقديري - بدون بيانات حقيقية)"
     else:
         if candles and len(candles) >= 20:
             result = analyze_live(candles, expiry)
@@ -976,7 +964,6 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
     strength = result.get('strength', {})
     rocket_display = strength.get('rocket', '🚀')
     strength_level = strength.get('level', 'متوسطة')
-    strength_score = strength.get('score', 0)
 
     if result['direction'] == "WAIT ⏳":
         final_text = (
