@@ -3,9 +3,9 @@ nixPkgs = ["python311", "python311Packages.pip"]
 
 [phases.install]
 cmds = [
-  "pip3 install --break-system-packages --upgrade pip",
-  "pip3 install --break-system-packages python-telegram-bot numpy aiohttp websockets requests pycryptodome pytz"
+  "pip install --break-system-packages --upgrade pip",
+  "pip install --break-system-packages -r requirements.txt"
 ]
 
 [start]
-cmd = "python3 bot.py"
+cmd = "python bot.py"
