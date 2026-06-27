@@ -1,18 +1,19 @@
 import logging
 import asyncio
 import random
+import json
 import numpy as np
-from datetime import datetime, timezone, timedelta
 import aiohttp
+import websockets
+from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8754472585:AAHSvci8Mya7QkalHUW0Y3IybsNWB1p1uUY"
-PO_SSID = "PO_SSID = '42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]'
-"
+BOT_TOKEN = "8754472585:AAGIX510vMHTRCTJaGVdnsjn8HjcPqq9-HQ"
+PO_SSID = '42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]'
 
 OTC_PAIRS = [
     {"name": "AED/CNY OTC", "flag": "🇦🇪", "type": "otc", "symbol": "AEDCNY_otc"},
@@ -38,6 +39,139 @@ LIVE_PAIRS = [
 
 ALL_PAIRS = OTC_PAIRS + LIVE_PAIRS
 
+# ===== Pocket Option WebSocket =====
+
+PO_WS_REGIONS = [
+    "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
+    "wss://api-c.po.market/socket.io/?EIO=4&transport=websocket",
+    "wss://api-s.po.market/socket.io/?EIO=4&transport=websocket",
+]
+
+async def fetch_po_candles(symbol: str, count: int = 80):
+    """سحب شموع OTC حقيقية من Pocket Option WebSocket"""
+    for ws_url in PO_WS_REGIONS:
+        try:
+            candles = await _connect_and_fetch(ws_url, symbol, count)
+            if candles and len(candles) >= 20:
+                logger.info(f"✅ PO WebSocket: {len(candles)} candles for {symbol}")
+                return candles
+        except Exception as e:
+            logger.warning(f"PO WS failed {ws_url}: {e}")
+            continue
+    return None
+
+async def _connect_and_fetch(ws_url: str, symbol: str, count: int):
+    candles = []
+    try:
+        async with websockets.connect(
+            ws_url,
+            extra_headers={
+                "Origin": "https://pocketoption.com",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            ping_interval=20,
+            ping_timeout=10,
+            close_timeout=5,
+        ) as ws:
+            # انتظر رسالة الترحيب
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            logger.info(f"PO WS connected: {msg[:50]}")
+
+            # أرسل upgrade
+            await ws.send("40")
+            await asyncio.wait_for(ws.recv(), timeout=5)
+
+            # أرسل auth
+            await ws.send(PO_SSID)
+
+            # انتظر auth success
+            auth_success = False
+            for _ in range(10):
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=3)
+                    if "auth/success" in msg:
+                        auth_success = True
+                        logger.info("✅ PO Auth Success")
+                        break
+                except asyncio.TimeoutError:
+                    break
+
+            if not auth_success:
+                return None
+
+            # طلب بيانات الشموع
+            now_ts = int(datetime.now().timestamp())
+            candle_request = json.dumps([
+                "subForHistory",
+                {
+                    "asset": symbol,
+                    "period": 60,
+                    "time": now_ts,
+                    "index": 0,
+                }
+            ])
+            await ws.send(f"42{candle_request}")
+
+            # استقبال البيانات
+            for _ in range(20):
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=3)
+
+                    if "candles" in msg or "history" in msg or "loadHistoryPeriod" in msg:
+                        # تحليل البيانات
+                        if msg.startswith("42"):
+                            data = json.loads(msg[2:])
+                            if isinstance(data, list) and len(data) >= 2:
+                                payload = data[1]
+
+                                # شكل 1: قائمة شموع مباشرة
+                                if isinstance(payload, list):
+                                    for c in payload:
+                                        if isinstance(c, dict) and "open" in c:
+                                            candles.append({
+                                                "open": float(c.get("open", 0)),
+                                                "close": float(c.get("close", 0)),
+                                                "high": float(c.get("high", c.get("close", 0))),
+                                                "low": float(c.get("low", c.get("close", 0))),
+                                            })
+
+                                # شكل 2: dict يحتوي candles
+                                elif isinstance(payload, dict):
+                                    raw = payload.get("candles") or payload.get("data") or payload.get("history") or []
+                                    for c in raw:
+                                        if isinstance(c, (list, tuple)) and len(c) >= 4:
+                                            candles.append({
+                                                "open": float(c[1]),
+                                                "close": float(c[4]) if len(c) > 4 else float(c[3]),
+                                                "high": float(c[2]),
+                                                "low": float(c[3]),
+                                            })
+                                        elif isinstance(c, dict) and "open" in c:
+                                            candles.append({
+                                                "open": float(c.get("open", 0)),
+                                                "close": float(c.get("close", 0)),
+                                                "high": float(c.get("high", c.get("close", 0))),
+                                                "low": float(c.get("low", c.get("close", 0))),
+                                            })
+
+                                if len(candles) >= 20:
+                                    break
+
+                    # keep-alive
+                    elif msg == "2":
+                        await ws.send("3")
+
+                except asyncio.TimeoutError:
+                    continue
+
+    except Exception as e:
+        logger.warning(f"WS error: {e}")
+        return None
+
+    return candles[-count:] if len(candles) >= 20 else None
+
+# ===== Yahoo Finance للأسواق الحقيقية =====
+
 async def fetch_yahoo_candles(symbol: str, count: int = 80):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -62,17 +196,16 @@ async def fetch_yahoo_candles(symbol: str, count: int = 80):
             if closes[i] is None or opens[i] is None:
                 continue
             candles.append({
-                "open": opens[i],
-                "close": closes[i],
+                "open": opens[i], "close": closes[i],
                 "high": highs[i] if highs[i] else closes[i],
                 "low": lows[i] if lows[i] else closes[i],
             })
-        if len(candles) < 20:
-            return None
-        return candles[-count:]
+        return candles[-count:] if len(candles) >= 20 else None
     except Exception as e:
-        logger.warning(f"Yahoo Finance error for {symbol}: {e}")
+        logger.warning(f"Yahoo error: {e}")
         return None
+
+# ===== المؤشرات =====
 
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -87,8 +220,7 @@ def calc_rsi(closes, period=14):
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
         return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
+    return round(100 - (100 / (1 + avg_gain / avg_loss)), 2)
 
 def calc_ema(closes, period):
     if len(closes) < period:
@@ -121,23 +253,10 @@ def calc_stochastic(closes, period=14):
     if len(closes) < period:
         return 50.0
     recent = closes[-period:]
-    lowest = min(recent)
-    highest = max(recent)
+    lowest, highest = min(recent), max(recent)
     if highest == lowest:
         return 50.0
     return round(((closes[-1] - lowest) / (highest - lowest)) * 100, 2)
-
-def calc_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return 0
-    trs = []
-    for i in range(1, len(candles)):
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        prev_close = candles[i-1]["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    return round(np.mean(trs[-period:]), 6)
 
 def calc_williams_r(candles, period=14):
     if len(candles) < period:
@@ -145,83 +264,65 @@ def calc_williams_r(candles, period=14):
     recent = candles[-period:]
     highest_high = max(c["high"] for c in recent)
     lowest_low = min(c["low"] for c in recent)
-    current_close = candles[-1]["close"]
     if highest_high == lowest_low:
         return -50.0
-    wr = ((highest_high - current_close) / (highest_high - lowest_low)) * -100
-    return round(wr, 2)
+    return round(((highest_high - candles[-1]["close"]) / (highest_high - lowest_low)) * -100, 2)
 
 def calc_cci(candles, period=20):
     if len(candles) < period:
         return 0
-    typical_prices = [(c["high"] + c["low"] + c["close"]) / 3 for c in candles[-period:]]
-    mean_tp = np.mean(typical_prices)
-    mean_dev = np.mean([abs(tp - mean_tp) for tp in typical_prices])
+    tp = [(c["high"] + c["low"] + c["close"]) / 3 for c in candles[-period:]]
+    mean_tp = np.mean(tp)
+    mean_dev = np.mean([abs(t - mean_tp) for t in tp])
     if mean_dev == 0:
         return 0
-    cci = (typical_prices[-1] - mean_tp) / (0.015 * mean_dev)
-    return round(cci, 2)
+    return round((tp[-1] - mean_tp) / (0.015 * mean_dev), 2)
 
-def calc_vwap_proxy(candles):
-    if len(candles) < 5:
-        return candles[-1]["close"]
-    typical_prices = [(c["high"] + c["low"] + c["close"]) / 3 for c in candles[-20:]]
-    return round(np.mean(typical_prices), 6)
-
-def detect_support_resistance(candles):
-    if len(candles) < 20:
-        return None, None
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    return round(min(lows[-20:]), 6), round(max(highs[-20:]), 6)
+def calc_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return 0
+    trs = [max(candles[i]["high"] - candles[i]["low"],
+               abs(candles[i]["high"] - candles[i-1]["close"]),
+               abs(candles[i]["low"] - candles[i-1]["close"]))
+           for i in range(1, len(candles))]
+    return round(np.mean(trs[-period:]), 6)
 
 def detect_patterns(candles):
-    patterns = []
+    patterns, score = [], 0
     if len(candles) < 3:
-        return patterns, 0
-    score = 0
+        return patterns, score
     c = candles
-    if (c[-2]["close"] < c[-2]["open"] and c[-1]["close"] > c[-1]["open"] and
-        c[-1]["open"] < c[-2]["close"] and c[-1]["close"] > c[-2]["open"]):
-        patterns.append("🕯 Bullish Engulfing")
-        score += 4
-    if (c[-2]["close"] > c[-2]["open"] and c[-1]["close"] < c[-1]["open"] and
-        c[-1]["open"] > c[-2]["close"] and c[-1]["close"] < c[-2]["open"]):
-        patterns.append("🕯 Bearish Engulfing")
-        score -= 4
     body = abs(c[-1]["close"] - c[-1]["open"])
     total = c[-1]["high"] - c[-1]["low"]
+
+    if (c[-2]["close"] < c[-2]["open"] and c[-1]["close"] > c[-1]["open"] and
+            c[-1]["open"] < c[-2]["close"] and c[-1]["close"] > c[-2]["open"]):
+        patterns.append("🕯 Bullish Engulfing"); score += 4
+
+    if (c[-2]["close"] > c[-2]["open"] and c[-1]["close"] < c[-1]["open"] and
+            c[-1]["open"] > c[-2]["close"] and c[-1]["close"] < c[-2]["open"]):
+        patterns.append("🕯 Bearish Engulfing"); score -= 4
+
     if total > 0 and body / total < 0.1:
         patterns.append("⚖️ Doji")
-    if (c[-1]["low"] < min(c[-1]["open"], c[-1]["close"]) - (body * 2) and
-        c[-1]["high"] - max(c[-1]["open"], c[-1]["close"]) < body):
-        patterns.append("📌 Bullish Pin Bar")
-        score += 3
-    if (c[-1]["high"] > max(c[-1]["open"], c[-1]["close"]) + (body * 2) and
-        min(c[-1]["open"], c[-1]["close"]) - c[-1]["low"] < body):
-        patterns.append("📌 Bearish Pin Bar")
-        score -= 3
+
     if len(c) >= 3:
         if (c[-3]["close"] < c[-3]["open"] and
-            abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
-            c[-1]["close"] > c[-1]["open"] and
-            c[-1]["close"] > (c[-3]["open"] + c[-3]["close"]) / 2):
-            patterns.append("🌟 Morning Star")
-            score += 4
-    if len(c) >= 3:
+                abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
+                c[-1]["close"] > (c[-3]["open"] + c[-3]["close"]) / 2):
+            patterns.append("🌟 Morning Star"); score += 4
+
         if (c[-3]["close"] > c[-3]["open"] and
-            abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
-            c[-1]["close"] < c[-1]["open"] and
-            c[-1]["close"] < (c[-3]["open"] + c[-3]["close"]) / 2):
-            patterns.append("🌟 Evening Star")
-            score -= 4
+                abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
+                c[-1]["close"] < (c[-3]["open"] + c[-3]["close"]) / 2):
+            patterns.append("🌟 Evening Star"); score -= 4
+
     if all(c[-i]["close"] > c[-i]["open"] for i in range(1, 4)):
-        patterns.append("🟢 Three Bullish Candles")
-        score += 2
+        patterns.append("🟢 Three Bullish Candles"); score += 2
     if all(c[-i]["close"] < c[-i]["open"] for i in range(1, 4)):
-        patterns.append("🔴 Three Bearish Candles")
-        score -= 2
-    return patterns[:3], score
+        patterns.append("🔴 Three Bearish Candles"); score -= 2
+
+    return patterns[:2], score
 
 def analyze_real(candles, expiry, pair_type, data_source="smart"):
     closes = [c["close"] for c in candles]
@@ -233,84 +334,60 @@ def analyze_real(candles, expiry, pair_type, data_source="smart"):
     macd_line, macd_signal = calc_macd(closes)
     bb_mid, bb_up, bb_low = calc_bollinger(closes)
     stoch = calc_stochastic(closes)
-    williams_r = calc_williams_r(candles)
+    wr = calc_williams_r(candles)
     cci = calc_cci(candles)
     atr = calc_atr(candles)
-    vwap = calc_vwap_proxy(candles)
-    support, resistance = detect_support_resistance(candles)
     current_price = closes[-1]
+    vwap = round(np.mean([(c["high"] + c["low"] + c["close"]) / 3 for c in candles[-20:]]), 6)
+    support = round(min(c["low"] for c in candles[-20:]), 6)
+    resistance = round(max(c["high"] for c in candles[-20:]), 6)
 
     buy_score = 0
     sell_score = 0
     signals_detail = []
 
-    if rsi < 25:
-        buy_score += 3; signals_detail.append(f"🟢 RSI Oversold ({rsi})")
-    elif rsi < 38:
-        buy_score += 1.5; signals_detail.append(f"🟡 RSI Low ({rsi})")
-    elif rsi > 75:
-        sell_score += 3; signals_detail.append(f"🔴 RSI Overbought ({rsi})")
-    elif rsi > 62:
-        sell_score += 1.5; signals_detail.append(f"🟡 RSI High ({rsi})")
+    if rsi < 25: buy_score += 3; signals_detail.append(f"🟢 RSI Oversold ({rsi})")
+    elif rsi < 38: buy_score += 1.5; signals_detail.append(f"🟡 RSI Low ({rsi})")
+    elif rsi > 75: sell_score += 3; signals_detail.append(f"🔴 RSI Overbought ({rsi})")
+    elif rsi > 62: sell_score += 1.5; signals_detail.append(f"🟡 RSI High ({rsi})")
 
     if rsi_fast < 20: buy_score += 2
     elif rsi_fast > 80: sell_score += 2
 
-    if ema9 > ema21:
-        buy_score += 3; signals_detail.append("🟢 Golden Cross EMA 9/21")
-    else:
-        sell_score += 3; signals_detail.append("🔴 Death Cross EMA 9/21")
+    if ema9 > ema21: buy_score += 3; signals_detail.append("🟢 Golden Cross EMA 9/21")
+    else: sell_score += 3; signals_detail.append("🔴 Death Cross EMA 9/21")
 
     if len(closes) >= 50:
-        if current_price > ema50:
-            buy_score += 2; signals_detail.append("🟢 Price above EMA50")
-        else:
-            sell_score += 2; signals_detail.append("🔴 Price below EMA50")
+        if current_price > ema50: buy_score += 2; signals_detail.append("🟢 Above EMA50")
+        else: sell_score += 2; signals_detail.append("🔴 Below EMA50")
 
-    if macd_line > macd_signal:
-        buy_score += 3; signals_detail.append("🟢 MACD Bullish")
-    else:
-        sell_score += 3; signals_detail.append("🔴 MACD Bearish")
+    if macd_line > macd_signal: buy_score += 3; signals_detail.append("🟢 MACD Bullish")
+    else: sell_score += 3; signals_detail.append("🔴 MACD Bearish")
 
-    if current_price <= bb_low:
-        buy_score += 3; signals_detail.append("🟢 BB Lower — BUY Zone")
-    elif current_price >= bb_up:
-        sell_score += 3; signals_detail.append("🔴 BB Upper — SELL Zone")
+    if current_price <= bb_low: buy_score += 3; signals_detail.append("🟢 BB Lower — BUY Zone")
+    elif current_price >= bb_up: sell_score += 3; signals_detail.append("🔴 BB Upper — SELL Zone")
 
-    if stoch < 20:
-        buy_score += 2; signals_detail.append(f"🟢 Stoch Oversold ({stoch})")
-    elif stoch > 80:
-        sell_score += 2; signals_detail.append(f"🔴 Stoch Overbought ({stoch})")
+    if stoch < 20: buy_score += 2; signals_detail.append(f"🟢 Stoch Oversold ({stoch})")
+    elif stoch > 80: sell_score += 2; signals_detail.append(f"🔴 Stoch Overbought ({stoch})")
 
-    if williams_r < -80:
-        buy_score += 2; signals_detail.append(f"🟢 Williams %R Oversold ({williams_r})")
-    elif williams_r > -20:
-        sell_score += 2; signals_detail.append(f"🔴 Williams %R Overbought ({williams_r})")
+    if wr < -80: buy_score += 2; signals_detail.append(f"🟢 W%R Oversold ({wr})")
+    elif wr > -20: sell_score += 2; signals_detail.append(f"🔴 W%R Overbought ({wr})")
 
-    if cci < -150:
-        buy_score += 2; signals_detail.append(f"🟢 CCI Oversold ({cci})")
-    elif cci > 150:
-        sell_score += 2; signals_detail.append(f"🔴 CCI Overbought ({cci})")
+    if cci < -150: buy_score += 2; signals_detail.append(f"🟢 CCI Oversold ({cci})")
+    elif cci > 150: sell_score += 2; signals_detail.append(f"🔴 CCI Overbought ({cci})")
 
-    if current_price < vwap:
-        buy_score += 1.5; signals_detail.append("🟢 Below VWAP")
-    else:
-        sell_score += 1.5; signals_detail.append("🔴 Above VWAP")
+    if current_price < vwap: buy_score += 1.5; signals_detail.append("🟢 Below VWAP")
+    else: sell_score += 1.5; signals_detail.append("🔴 Above VWAP")
 
-    if support and resistance:
-        sr_range = resistance - support
-        if sr_range > 0:
-            position_pct = (current_price - support) / sr_range * 100
-            if position_pct < 15:
-                buy_score += 3; signals_detail.append("🟢 Near Support Level")
-            elif position_pct > 85:
-                sell_score += 3; signals_detail.append("🔴 Near Resistance Level")
+    sr_range = resistance - support
+    if sr_range > 0:
+        pos = (current_price - support) / sr_range * 100
+        if pos < 15: buy_score += 3; signals_detail.append("🟢 Near Support")
+        elif pos > 85: sell_score += 3; signals_detail.append("🔴 Near Resistance")
 
-    patterns, pattern_score = detect_patterns(candles)
-    if pattern_score > 0:
-        buy_score += abs(pattern_score)
-    else:
-        sell_score += abs(pattern_score)
+    patterns, pscore = detect_patterns(candles)
+    if pscore > 0: buy_score += abs(pscore)
+    else: sell_score += abs(pscore)
     signals_detail.extend(patterns)
 
     net_score = buy_score - sell_score
@@ -318,97 +395,66 @@ def analyze_real(candles, expiry, pair_type, data_source="smart"):
     total_score = buy_score + sell_score
 
     if total_score > 0:
-        agreement_ratio = max(buy_score, sell_score) / total_score
-        base_confidence = 50 + (agreement_ratio - 0.5) * 80
+        ratio = max(buy_score, sell_score) / total_score
+        base_conf = 50 + (ratio - 0.5) * 80
     else:
-        base_confidence = 62
+        base_conf = 62
 
     if atr > 0:
-        atr_normalized = min(atr / (current_price * 0.001), 3)
-        base_confidence += atr_normalized * 2
-
+        base_conf += min(atr / (current_price * 0.001), 3) * 2
     if abs(net_score) < 3:
-        base_confidence = min(base_confidence, 68)
+        base_conf = min(base_conf, 68)
+    if data_source in ["yahoo", "pocket_option"]:
+        base_conf = min(base_conf + 5, 96)
 
-    if data_source == "yahoo":
-        base_confidence = min(base_confidence + 5, 96)
-
-    confidence = min(96, max(55, int(base_confidence)))
+    confidence = min(96, max(55, int(base_conf)))
     arrow = "⬆️" if direction == "BUY" else "⬇️"
 
-    note_buy = [
-        "⚡ Multi-indicator BUY confirmation!",
-        "🚀 RSI + MACD + BB = High probability BUY",
-        "📊 Price at demand zone — BUY opportunity",
-        "🎯 Oscillators confirm oversold — BUY",
-    ]
-    note_sell = [
-        "⚡ Multi-indicator SELL confirmation!",
-        "📉 RSI + MACD + BB = High probability SELL",
-        "📊 Price at supply zone — SELL opportunity",
-        "🎯 Oscillators confirm overbought — SELL",
-    ]
-
-    note = random.choice(note_buy if direction == "BUY" else note_sell)
-    source_label = {
-        "yahoo": "📡 Yahoo Finance",
+    source_labels = {
+        "pocket_option": "🟢 Pocket Option (Live OTC)",
+        "yahoo": "📡 Yahoo Finance (Live)",
         "smart": "🧠 Smart Analysis",
-    }.get(data_source, "🧠 Smart Analysis")
+    }
 
     return {
-        "direction": direction,
-        "arrow": arrow,
-        "confidence": confidence,
-        "note": note,
-        "signals": signals_detail[:5],
-        "rsi": rsi,
-        "stoch": stoch,
-        "williams_r": williams_r,
-        "cci": cci,
-        "atr": atr,
-        "price": current_price,
-        "buy_score": round(buy_score, 1),
-        "sell_score": round(sell_score, 1),
-        "source": source_label,
+        "direction": direction, "arrow": arrow, "confidence": confidence,
+        "signals": signals_detail[:5], "rsi": rsi, "stoch": stoch,
+        "williams_r": wr, "cci": cci, "atr": atr, "price": current_price,
+        "buy_score": round(buy_score, 1), "sell_score": round(sell_score, 1),
+        "source": source_labels.get(data_source, "🧠 Smart Analysis"),
     }
 
 def analyze_smart(pair_name, expiry, pair_type):
     now = datetime.now()
-    seed_str = f"{pair_name}{expiry}{now.hour}{now.minute // 2}{now.second // 15}"
-    seed = sum(ord(c) for c in seed_str)
+    seed = sum(ord(c) for c in f"{pair_name}{expiry}{now.hour}{now.minute // 2}{now.second // 15}")
     random.seed(seed)
     np.random.seed(seed % (2**31))
     base = 1.1000
     candles = []
     for _ in range(80):
-        open_p = base + np.random.normal(0, 0.0008)
-        close_p = open_p + np.random.normal(0, 0.0006)
-        high_p = max(open_p, close_p) + abs(np.random.normal(0, 0.0003))
-        low_p = min(open_p, close_p) - abs(np.random.normal(0, 0.0003))
-        candles.append({"open": open_p, "close": close_p, "high": high_p, "low": low_p})
-        base = close_p
+        o = base + np.random.normal(0, 0.0008)
+        c = o + np.random.normal(0, 0.0006)
+        h = max(o, c) + abs(np.random.normal(0, 0.0003))
+        l = min(o, c) - abs(np.random.normal(0, 0.0003))
+        candles.append({"open": o, "close": c, "high": h, "low": l})
+        base = c
     return analyze_real(candles, expiry, pair_type, data_source="smart")
 
 def get_entry_time(expiry):
-    """حساب وقت الدخول بتوقيت UTC+3"""
     utc3 = timezone(timedelta(hours=3))
     now = datetime.now(utc3)
-
-    # إذا الوقت أقل من 30 ثانية على نهاية الدقيقة، ادخل الدقيقة القادمة
     if now.second >= 30:
         entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
         candle_note = "الشمعة القادمة ⏭"
     else:
         entry = now.replace(second=0, microsecond=0)
         candle_note = "الشمعة الحالية ▶️"
-
     hour = entry.hour
-    minute = entry.strftime("%M")
     period = "صباحاً" if hour < 12 else "مساءً"
     hour_12 = hour % 12 or 12
-    time_str = f"{hour_12}:{minute} {period}"
+    return f"{hour_12}:{entry.strftime('%M')} {period}", candle_note
 
-    return time_str, candle_note
+# ===== كيبوردات =====
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup([
@@ -439,13 +485,13 @@ def get_expiry_keyboard(pair_name, pair_type):
     if pair_type == "otc":
         keyboard = [
             [
-                InlineKeyboardButton("⚡ S5",  callback_data=f"expiry|S5|{pair_name}|{pair_type}"),
+                InlineKeyboardButton("⚡ S5", callback_data=f"expiry|S5|{pair_name}|{pair_type}"),
                 InlineKeyboardButton("⚡ S10", callback_data=f"expiry|S10|{pair_name}|{pair_type}"),
                 InlineKeyboardButton("⚡ S15", callback_data=f"expiry|S15|{pair_name}|{pair_type}"),
             ],
             [
-                InlineKeyboardButton("⏱ M1",  callback_data=f"expiry|M1|{pair_name}|{pair_type}"),
-                InlineKeyboardButton("⏱ M2",  callback_data=f"expiry|M2|{pair_name}|{pair_type}"),
+                InlineKeyboardButton("⏱ M1", callback_data=f"expiry|M1|{pair_name}|{pair_type}"),
+                InlineKeyboardButton("⏱ M2", callback_data=f"expiry|M2|{pair_name}|{pair_type}"),
             ],
         ]
     else:
@@ -462,12 +508,14 @@ def find_pair(text):
             return pair
     return None
 
+# ===== هاندلرز =====
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *مرحباً في VaultFX AI Bot* 🤖\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📡 *Live:* بيانات Yahoo Finance الحقيقية\n"
-        "🧠 *OTC:* تحليل ذكي متقدم\n"
+        "🟢 *OTC:* بيانات Pocket Option حقيقية\n"
+        "📡 *Live:* بيانات Yahoo Finance حقيقية\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "اختر نوع السوق:",
         parse_mode="Markdown",
@@ -480,10 +528,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🏠 القائمة الرئيسية:", reply_markup=get_main_keyboard())
         return
     if text == "📊 OTC Pairs":
-        await update.message.reply_text("📊 *OTC Pairs* — اختر الزوج:", parse_mode="Markdown", reply_markup=get_otc_keyboard())
+        await update.message.reply_text("📊 *OTC Pairs*", parse_mode="Markdown", reply_markup=get_otc_keyboard())
         return
     if text == "💹 Live Market":
-        await update.message.reply_text("💹 *Live Market* — اختر الزوج:", parse_mode="Markdown", reply_markup=get_live_keyboard())
+        await update.message.reply_text("💹 *Live Market*", parse_mode="Markdown", reply_markup=get_live_keyboard())
         return
     pair = find_pair(text)
     if pair:
@@ -500,69 +548,56 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     data = query.data.split("|")
-    expiry = data[1]
-    pair_name = data[2]
-    pair_type = data[3]
+    expiry, pair_name, pair_type = data[1], data[2], data[3]
     pair = find_pair(pair_name)
-
     if not pair:
         await query.edit_message_text("❌ خطأ، حاول مجددًا.")
         return
 
-    await query.edit_message_text(
-        f"{pair['flag']} *{pair_name}* — ⏱ {expiry}",
-        parse_mode="Markdown"
-    )
+    await query.edit_message_text(f"{pair['flag']} *{pair_name}* — ⏱ {expiry}", parse_mode="Markdown")
 
     scan_msg = await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"🔍 *جاري تحليل السوق...*",
+        text="🔍 *جاري تحليل السوق...*",
         parse_mode="Markdown"
     )
 
     steps = [
-        "📡 *جاري سحب البيانات...*" if pair_type == "live" else "🧠 *جاري تشغيل التحليل...*",
+        "🟢 *جاري الاتصال بـ Pocket Option...*" if pair_type == "otc" else "📡 *جاري سحب البيانات...*",
         "📊 *تحليل RSI · EMA · MACD...*",
         "🔥 *فحص Williams%R · CCI · ATR...*",
         "🎯 *توليد الإشارة النهائية...*",
     ]
 
-    candles_task = None
-    if pair_type == "live":
+    # بدء سحب البيانات بالتوازي
+    if pair_type == "otc":
+        candles_task = asyncio.create_task(fetch_po_candles(pair["symbol"], 80))
+    else:
         candles_task = asyncio.create_task(fetch_yahoo_candles(pair["symbol"], 80))
 
     for step in steps:
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1)
         try:
-            await scan_msg.edit_text(f"{step}", parse_mode="Markdown")
+            await scan_msg.edit_text(step, parse_mode="Markdown")
         except:
             pass
 
-    data_source = "smart"
-    candles = None
-    if candles_task:
-        candles = await candles_task
-        if candles and len(candles) >= 20:
-            data_source = "yahoo"
+    candles = await candles_task
 
     if candles and len(candles) >= 20:
+        data_source = "pocket_option" if pair_type == "otc" else "yahoo"
         result = analyze_real(candles, expiry, pair_type, data_source=data_source)
     else:
         result = analyze_smart(pair_name, expiry, pair_type)
 
-    # وقت الدخول
     entry_time, candle_note = get_entry_time(expiry)
 
-    # نسبة التصويت
     vote_total = result['buy_score'] + result['sell_score']
-    if vote_total > 0:
-        bull_pct = int(result['buy_score'] / vote_total * 100)
-        bear_pct = 100 - bull_pct
-    else:
-        bull_pct, bear_pct = 50, 50
+    bull_pct = int(result['buy_score'] / vote_total * 100) if vote_total > 0 else 50
+    bear_pct = 100 - bull_pct
 
-    direction_ar = "شراء 🟢" if result['direction'] == "BUY" else "بيع 🔴"
     signal_emoji = "🟢" if result['direction'] == "BUY" else "🔴"
+    direction_ar = "شراء 🟢" if result['direction'] == "BUY" else "بيع 🔴"
 
     final_text = (
         f"{signal_emoji} *{result['direction']}*\n"
@@ -593,7 +628,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_expiry_selection, pattern="^expiry\\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 VaultFX AI Bot is running...")
+    print("🤖 VaultFX AI Bot v4 — Pocket Option WebSocket Active")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
