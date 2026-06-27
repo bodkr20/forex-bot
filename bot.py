@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8754472585:AAGIX510vMHTRCTJaGVdnsjn8HjcPqq9-HQ"
 
 # ✅ SSID الجديد المستخرج من ci_session
-PO_SSID = '42["auth",{"sessionToken":"aed3356f10d74157d08066c4731a3205","uid":"130213513","lang":"en"}]'
+PO_SSID = '42["auth",{"session":"a%3A4%3A%7Bs%3A10%3A%22session_id%22%3Bs%3A32%3A%22a4cb7bdffb9d586292f6581ca06d58cd%22%3Bs%3A10%3A%22ip_address%22%3Bs%3A15%3A%22146.251.186.204%22%3Bs%3A10%3A%22user_agent%22%3Bs%3A111%3A%22Mozilla%2F5.0%20%28Windows%20NT%2010.0%3B%20Win64%3B%20x64%29%20AppleWebKit%2F537.36%20%28KHTML%2C%20like%20Gecko%29%20Chrome%2F149.0.0.0%20Safari%2F537.36%22%3Bs%3A13%3A%22last_activity%22%3Bi%3A1782558214%3B%7Dfd6d478c88d84a1805c8c5cb9e508b3b","isDemo":1,"uid":"130213513","lang":"en"}]'
+
 
 OTC_PAIRS = [
     {"name": "AED/CNY OTC", "flag": "🇦🇪", "type": "otc", "symbol": "AEDCNY_otc"},
