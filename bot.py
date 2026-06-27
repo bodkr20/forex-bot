@@ -944,7 +944,7 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
         else:
             logger.info(f"⚠️ No real data for {pair_name}, using Smart Analysis")
             result = analyze_smart(pair_name, expiry, pair_type)
-            result["source"] = "🧠 Smart Analysis (تقديري - بدون بيانات حقيقية)"
+            result["source"] = "🧠 Smart Analysis 
     else:
         if candles and len(candles) >= 20:
             result = analyze_live(candles, expiry)
