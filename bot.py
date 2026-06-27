@@ -1,7 +1,7 @@
 import logging
 import asyncio
-import random
 import json
+import re
 import numpy as np
 import aiohttp
 import websockets
@@ -12,8 +12,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8754472585:AAHSvci8Mya7QkalHUW0Y3IybsNWB1p1uUY"
-PO_SSID = '42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]'
+BOT_TOKEN = "8754472585:AAGIX510vMHTRCTJaGVdnsjn8HjcPqq9-HQ"
+PO_SSID = 'PO_SSID = '42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]''
+ADMIN_CHAT_ID = "6921641426"
 
 OTC_PAIRS = [
     {"name": "AED/CNY OTC", "flag": "🇦🇪", "type": "otc", "symbol": "AEDCNY_otc"},
@@ -24,6 +25,10 @@ OTC_PAIRS = [
     {"name": "AUD/NZD OTC", "flag": "🇦🇺", "type": "otc", "symbol": "AUDNZD_otc"},
     {"name": "USD/JPY OTC", "flag": "🇺🇸", "type": "otc", "symbol": "USDJPY_otc"},
     {"name": "USD/CHF OTC", "flag": "🇺🇸", "type": "otc", "symbol": "USDCHF_otc"},
+    {"name": "AUD/USD OTC", "flag": "🇦🇺", "type": "otc", "symbol": "AUDUSD_otc"},
+    {"name": "EUR/HUF OTC", "flag": "🇪🇺", "type": "otc", "symbol": "EURHUF_otc"},
+    {"name": "GBP/AUD OTC", "flag": "🇬🇧", "type": "otc", "symbol": "GBPAUD_otc"},
+    {"name": "NZD/USD OTC", "flag": "🇳🇿", "type": "otc", "symbol": "NZDUSD_otc"},
 ]
 
 LIVE_PAIRS = [
@@ -31,7 +36,7 @@ LIVE_PAIRS = [
     {"name": "GBP/USD", "flag": "🇬🇧", "type": "live", "symbol": "GBPUSD=X"},
     {"name": "USD/JPY", "flag": "🇺🇸", "type": "live", "symbol": "JPY=X"},
     {"name": "AUD/USD", "flag": "🇦🇺", "type": "live", "symbol": "AUDUSD=X"},
-    {"name": "USD/CAD", "flag": "🇨", "type": "live", "symbol": "CAD=X"},
+    {"name": "USD/CAD", "flag": "🇨🇦", "type": "live", "symbol": "CAD=X"},
     {"name": "USD/CHF", "flag": "🇨🇭", "type": "live", "symbol": "CHF=X"},
     {"name": "NZD/USD", "flag": "🇳🇿", "type": "live", "symbol": "NZDUSD=X"},
     {"name": "GBP/JPY", "flag": "🇬🇧", "type": "live", "symbol": "GBPJPY=X"},
@@ -42,6 +47,8 @@ ALL_PAIRS = OTC_PAIRS + LIVE_PAIRS
 # ===== Pocket Option Cache =====
 po_candles_cache = {}
 po_connected = False
+ssid_last_updated = datetime.now()
+ssid_alert_sent = False
 
 PO_WS_REGIONS = [
     "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
@@ -142,10 +149,9 @@ async def fetch_po_candles(symbol: str, count: int = 80):
         return candles[-count:]
     return None
 
-# ===== Yahoo Finance - متعدد الإطارات الزمنية =====
+# ===== Yahoo Finance =====
 
 async def fetch_yahoo_multi(symbol: str):
-    """سحب بيانات من 3 إطارات زمنية مختلفة"""
     results = {}
     configs = [
         ("1m", "1d", "short"),
@@ -196,6 +202,8 @@ def calc_rsi(closes, period=14):
     losses = np.where(deltas < 0, -deltas, 0)
     avg_gain = np.mean(gains[:period])
     avg_loss = np.mean(losses[:period])
+    if avg_loss == 0:
+        return 100.0
     for i in range(period, len(deltas)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
@@ -274,7 +282,6 @@ def calc_momentum(closes, period=10):
     return round(closes[-1] - closes[-period], 6)
 
 def detect_trend(closes, period=20):
-    """كشف الاتجاه العام"""
     if len(closes) < period:
         return "neutral"
     recent = closes[-period:]
@@ -298,45 +305,35 @@ def detect_patterns(candles):
     if (c[-2]["close"] < c[-2]["open"] and c[-1]["close"] > c[-1]["open"] and
             c[-1]["open"] < c[-2]["close"] and c[-1]["close"] > c[-2]["open"]):
         patterns.append("🕯 Bullish Engulfing"); score += 4
-
     if (c[-2]["close"] > c[-2]["open"] and c[-1]["close"] < c[-1]["open"] and
             c[-1]["open"] > c[-2]["close"] and c[-1]["close"] < c[-2]["open"]):
         patterns.append("🕯 Bearish Engulfing"); score -= 4
-
     if total > 0 and body / total < 0.1:
         patterns.append("⚖️ Doji — Reversal")
-
     if (total > 0 and body / total < 0.3 and
             (c[-1]["high"] - max(c[-1]["open"], c[-1]["close"])) > body * 2):
         patterns.append("📌 Shooting Star"); score -= 3
-
     if (total > 0 and body / total < 0.3 and
             (min(c[-1]["open"], c[-1]["close"]) - c[-1]["low"]) > body * 2):
         patterns.append("📌 Hammer"); score += 3
-
     if len(c) >= 3:
         if (c[-3]["close"] < c[-3]["open"] and
                 abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
                 c[-1]["close"] > (c[-3]["open"] + c[-3]["close"]) / 2):
             patterns.append("🌟 Morning Star"); score += 5
-
         if (c[-3]["close"] > c[-3]["open"] and
                 abs(c[-2]["close"] - c[-2]["open"]) < abs(c[-3]["close"] - c[-3]["open"]) * 0.3 and
                 c[-1]["close"] < (c[-3]["open"] + c[-3]["close"]) / 2):
             patterns.append("🌟 Evening Star"); score -= 5
-
     if all(c[-i]["close"] > c[-i]["open"] for i in range(1, 4)):
         patterns.append("🟢 Three Bullish Candles"); score += 2
     if all(c[-i]["close"] < c[-i]["open"] for i in range(1, 4)):
         patterns.append("🔴 Three Bearish Candles"); score -= 2
-
     return patterns[:2], score
 
 def analyze_multi_timeframe(candles_dict, expiry):
-    """تحليل متعدد الإطارات الزمنية"""
     mtf_score = 0
     mtf_signals = []
-
     for label, candles in candles_dict.items():
         if not candles or len(candles) < 20:
             continue
@@ -345,7 +342,6 @@ def analyze_multi_timeframe(candles_dict, expiry):
         ema9 = calc_ema(closes, 9)
         ema21 = calc_ema(closes, 21)
         trend = detect_trend(closes)
-
         tf_score = 0
         if rsi < 35: tf_score += 2
         elif rsi > 65: tf_score -= 2
@@ -353,24 +349,156 @@ def analyze_multi_timeframe(candles_dict, expiry):
         else: tf_score -= 2
         if trend == "uptrend": tf_score += 1
         elif trend == "downtrend": tf_score -= 1
-
         weight = {"short": 3, "medium": 2, "long": 1}.get(label, 1)
         mtf_score += tf_score * weight
-
         label_ar = {"short": "1م", "medium": "5م", "long": "15م"}.get(label, label)
         direction = "🟢" if tf_score > 0 else "🔴"
         mtf_signals.append(f"{direction} TF {label_ar}: {'Bullish' if tf_score > 0 else 'Bearish'}")
-
     return mtf_score, mtf_signals
 
-def analyze_real(candles, expiry, pair_type, data_source="smart", candles_dict=None):
+def analyze_otc(candles, expiry):
     closes = [c["close"] for c in candles]
     rsi = calc_rsi(closes)
     rsi_fast = calc_rsi(closes, period=7)
     ema9 = calc_ema(closes, 9)
     ema21 = calc_ema(closes, 21)
     ema50 = calc_ema(closes, 50)
-    ema200 = calc_ema(closes, 200) if len(closes) >= 200 else calc_ema(closes, len(closes))
+    macd_line, macd_signal = calc_macd(closes)
+    bb_mid, bb_up, bb_low = calc_bollinger(closes)
+    stoch = calc_stochastic(closes)
+    wr = calc_williams_r(candles)
+    cci = calc_cci(candles)
+    atr = calc_atr(candles)
+    momentum = calc_momentum(closes)
+    trend = detect_trend(closes)
+    current_price = closes[-1]
+    support = round(min(c["low"] for c in candles[-20:]), 6)
+    resistance = round(max(c["high"] for c in candles[-20:]), 6)
+
+    buy_score = 0.0
+    sell_score = 0.0
+    signals_detail = []
+
+    if rsi < 18:
+        buy_score += 8; signals_detail.append(f"🟢 RSI Deep Oversold ({rsi})")
+    elif rsi < 30:
+        buy_score += 3; signals_detail.append(f"🟡 RSI Low ({rsi})")
+    elif rsi > 82:
+        sell_score += 8; signals_detail.append(f"🔴 RSI High Overbought ({rsi})")
+    elif rsi > 68:
+        sell_score += 3; signals_detail.append(f"🟡 RSI High ({rsi})")
+    else:
+        signals_detail.append(f"⚪ RSI Neutral ({rsi})")
+
+    if rsi_fast < 14: buy_score += 4
+    elif rsi_fast > 86: sell_score += 4
+
+    if ema9 > ema21:
+        buy_score += 5; signals_detail.append("🟢 Golden Cross EMA 9/21")
+    else:
+        sell_score += 5; signals_detail.append("🔴 Death Cross EMA 9/21")
+
+    if current_price > ema50:
+        buy_score += 3; signals_detail.append("🟢 Above EMA50")
+    else:
+        sell_score += 3; signals_detail.append("🔴 Below EMA50")
+
+    if trend == "uptrend":
+        buy_score += 5; signals_detail.append("🟢 Uptrend")
+    elif trend == "downtrend":
+        sell_score += 5; signals_detail.append("🔴 Downtrend")
+    else:
+        signals_detail.append("⚪ Sideways")
+        buy_score -= 2; sell_score -= 2
+
+    if macd_line > macd_signal:
+        buy_score += 5; signals_detail.append("🟢 MACD Bullish")
+    else:
+        sell_score += 5; signals_detail.append("🔴 MACD Bearish")
+
+    if momentum > 0:
+        buy_score += 2.5; signals_detail.append("🟢 Positive Momentum")
+    else:
+        sell_score += 2.5; signals_detail.append("🔴 Negative Momentum")
+
+    if current_price <= bb_low:
+        buy_score += 5; signals_detail.append("🟢 BB Lower — BUY")
+    elif current_price >= bb_up:
+        sell_score += 5; signals_detail.append("🔴 BB Upper — SELL")
+
+    if stoch < 12:
+        buy_score += 4; signals_detail.append(f"🟢 Stoch Deep Oversold ({stoch})")
+    elif stoch > 88:
+        sell_score += 4; signals_detail.append(f"🔴 Stoch High Overbought ({stoch})")
+
+    if wr < -88:
+        buy_score += 4; signals_detail.append(f"🟢 W%R Deep Oversold ({wr})")
+    elif wr > -12:
+        sell_score += 4; signals_detail.append(f"🔴 W%R High Overbought ({wr})")
+
+    if cci < -220:
+        buy_score += 4; signals_detail.append(f"🟢 CCI Deep Oversold ({cci})")
+    elif cci > 220:
+        sell_score += 4; signals_detail.append(f"🔴 CCI High Overbought ({cci})")
+
+    sr_range = resistance - support
+    if sr_range > 0:
+        pos = (current_price - support) / sr_range * 100
+        if pos < 10:
+            buy_score += 6; signals_detail.append("🟢 Strong Support 🎯")
+        elif pos > 90:
+            sell_score += 6; signals_detail.append("🔴 Strong Resistance 🎯")
+
+    patterns, pscore = detect_patterns(candles)
+    if pscore > 0: buy_score += abs(pscore)
+    else: sell_score += abs(pscore)
+    signals_detail.extend(patterns)
+
+    net_score = buy_score - sell_score
+    total_score = buy_score + sell_score
+
+    if total_score > 0:
+        ratio = max(buy_score, sell_score) / total_score
+        base_conf = 50 + (ratio - 0.5) * 90
+    else:
+        base_conf = 60
+
+    if atr > 0:
+        base_conf += min(atr / (current_price * 0.001), 3) * 2
+
+    if trend == "sideways":
+        base_conf = min(base_conf, 68)
+
+    if abs(net_score) < 6:
+        base_conf = min(base_conf, 62)
+    elif abs(net_score) > 22:
+        base_conf = min(base_conf + 7, 96)
+
+    confidence = min(96, max(55, int(base_conf)))
+
+    if confidence < 75:
+        direction = "WAIT ⏳"
+        arrow = "⏳"
+    else:
+        direction = "BUY" if net_score >= 0 else "SELL"
+        arrow = "⬆️" if direction == "BUY" else "⬇️"
+
+    return {
+        "direction": direction, "arrow": arrow, "confidence": confidence,
+        "signals": signals_detail[:5],
+        "rsi": rsi, "stoch": stoch, "wr": wr, "cci": cci, "atr": atr,
+        "price": current_price, "trend": trend,
+        "buy_score": round(buy_score, 1), "sell_score": round(sell_score, 1),
+        "source": "🟢 Pocket Option (Live OTC)",
+    }
+
+def analyze_live(candles, expiry, candles_dict=None):
+    closes = [c["close"] for c in candles]
+    rsi = calc_rsi(closes)
+    rsi_fast = calc_rsi(closes, period=7)
+    ema9 = calc_ema(closes, 9)
+    ema21 = calc_ema(closes, 21)
+    ema50 = calc_ema(closes, 50)
     macd_line, macd_signal = calc_macd(closes)
     bb_mid, bb_up, bb_low = calc_bollinger(closes)
     stoch = calc_stochastic(closes)
@@ -388,73 +516,85 @@ def analyze_real(candles, expiry, pair_type, data_source="smart", candles_dict=N
     sell_score = 0.0
     signals_detail = []
 
-    # RSI
-    if rsi < 25: buy_score += 4; signals_detail.append(f"🟢 RSI Oversold ({rsi})")
-    elif rsi < 38: buy_score += 2; signals_detail.append(f"🟡 RSI Low ({rsi})")
-    elif rsi > 75: sell_score += 4; signals_detail.append(f"🔴 RSI Overbought ({rsi})")
-    elif rsi > 62: sell_score += 2; signals_detail.append(f"🟡 RSI High ({rsi})")
-    else: signals_detail.append(f"⚪ RSI Neutral ({rsi})")
+    if rsi < 25:
+        buy_score += 4; signals_detail.append(f"🟢 RSI Oversold ({rsi})")
+    elif rsi < 38:
+        buy_score += 2; signals_detail.append(f"🟡 RSI Low ({rsi})")
+    elif rsi > 75:
+        sell_score += 4; signals_detail.append(f"🔴 RSI Overbought ({rsi})")
+    elif rsi > 62:
+        sell_score += 2; signals_detail.append(f"🟡 RSI High ({rsi})")
+    else:
+        signals_detail.append(f"⚪ RSI Neutral ({rsi})")
 
     if rsi_fast < 20: buy_score += 2
     elif rsi_fast > 80: sell_score += 2
 
-    # EMA
-    if ema9 > ema21: buy_score += 3; signals_detail.append("🟢 Golden Cross EMA 9/21")
-    else: sell_score += 3; signals_detail.append("🔴 Death Cross EMA 9/21")
-
-    if current_price > ema50: buy_score += 2; signals_detail.append("🟢 Above EMA50")
-    else: sell_score += 2; signals_detail.append("🔴 Below EMA50")
-
-    # Trend
-    if trend == "uptrend": buy_score += 3; signals_detail.append("🟢 Uptrend Detected")
-    elif trend == "downtrend": sell_score += 3; signals_detail.append("🔴 Downtrend Detected")
-    else: signals_detail.append("⚪ Sideways Market")
-
-    # MACD
-    if macd_line > macd_signal: buy_score += 3; signals_detail.append("🟢 MACD Bullish")
-    else: sell_score += 3; signals_detail.append("🔴 MACD Bearish")
-
-    # Momentum
-    if momentum > 0: buy_score += 1.5; signals_detail.append("🟢 Positive Momentum")
-    else: sell_score += 1.5; signals_detail.append("🔴 Negative Momentum")
-
-    # Bollinger
-    if current_price <= bb_low: buy_score += 3; signals_detail.append("🟢 BB Lower — BUY Zone")
-    elif current_price >= bb_up: sell_score += 3; signals_detail.append("🔴 BB Upper — SELL Zone")
+    if ema9 > ema21:
+        buy_score += 3; signals_detail.append("🟢 Golden Cross EMA 9/21")
     else:
-        bb_pos = int(((current_price - bb_low) / (bb_up - bb_low)) * 100) if bb_up != bb_low else 50
-        signals_detail.append(f"⚪ BB Position: {bb_pos}%")
+        sell_score += 3; signals_detail.append("🔴 Death Cross EMA 9/21")
 
-    # Stochastic
-    if stoch < 20: buy_score += 2; signals_detail.append(f"🟢 Stoch Oversold ({stoch})")
-    elif stoch > 80: sell_score += 2; signals_detail.append(f"🔴 Stoch Overbought ({stoch})")
+    if current_price > ema50:
+        buy_score += 2; signals_detail.append("🟢 Above EMA50")
+    else:
+        sell_score += 2; signals_detail.append("🔴 Below EMA50")
 
-    # Williams %R
-    if wr < -80: buy_score += 2; signals_detail.append(f"🟢 W%R Oversold ({wr})")
-    elif wr > -20: sell_score += 2; signals_detail.append(f"🔴 W%R Overbought ({wr})")
+    if trend == "uptrend":
+        buy_score += 3; signals_detail.append("🟢 Uptrend")
+    elif trend == "downtrend":
+        sell_score += 3; signals_detail.append("🔴 Downtrend")
+    else:
+        signals_detail.append("⚪ Sideways")
 
-    # CCI
-    if cci < -150: buy_score += 2; signals_detail.append(f"🟢 CCI Oversold ({cci})")
-    elif cci > 150: sell_score += 2; signals_detail.append(f"🔴 CCI Overbought ({cci})")
+    if macd_line > macd_signal:
+        buy_score += 3; signals_detail.append("🟢 MACD Bullish")
+    else:
+        sell_score += 3; signals_detail.append("🔴 MACD Bearish")
 
-    # VWAP
-    if current_price < vwap: buy_score += 2; signals_detail.append("🟢 Below VWAP — Discount")
-    else: sell_score += 2; signals_detail.append("🔴 Above VWAP — Premium")
+    if momentum > 0:
+        buy_score += 1.5; signals_detail.append("🟢 Positive Momentum")
+    else:
+        sell_score += 1.5; signals_detail.append("🔴 Negative Momentum")
 
-    # Support/Resistance
+    if current_price <= bb_low:
+        buy_score += 3; signals_detail.append("🟢 BB Lower")
+    elif current_price >= bb_up:
+        sell_score += 3; signals_detail.append("🔴 BB Upper")
+
+    if stoch < 20:
+        buy_score += 2; signals_detail.append(f"🟢 Stoch Oversold ({stoch})")
+    elif stoch > 80:
+        sell_score += 2; signals_detail.append(f"🔴 Stoch Overbought ({stoch})")
+
+    if wr < -80:
+        buy_score += 2; signals_detail.append(f"🟢 W%R Oversold ({wr})")
+    elif wr > -20:
+        sell_score += 2; signals_detail.append(f"🔴 W%R Overbought ({wr})")
+
+    if cci < -150:
+        buy_score += 2; signals_detail.append(f"🟢 CCI Oversold ({cci})")
+    elif cci > 150:
+        sell_score += 2; signals_detail.append(f"🔴 CCI Overbought ({cci})")
+
+    if current_price < vwap:
+        buy_score += 2; signals_detail.append("🟢 Below VWAP")
+    else:
+        sell_score += 2; signals_detail.append("🔴 Above VWAP")
+
     sr_range = resistance - support
     if sr_range > 0:
         pos = (current_price - support) / sr_range * 100
-        if pos < 15: buy_score += 4; signals_detail.append("🟢 At Support Level 🎯")
-        elif pos > 85: sell_score += 4; signals_detail.append("🔴 At Resistance Level 🎯")
+        if pos < 15:
+            buy_score += 4; signals_detail.append("🟢 At Support 🎯")
+        elif pos > 85:
+            sell_score += 4; signals_detail.append("🔴 At Resistance 🎯")
 
-    # Patterns
     patterns, pscore = detect_patterns(candles)
     if pscore > 0: buy_score += abs(pscore)
     else: sell_score += abs(pscore)
     signals_detail.extend(patterns)
 
-    # Multi-timeframe
     mtf_score = 0
     mtf_signals = []
     if candles_dict and len(candles_dict) > 1:
@@ -466,7 +606,6 @@ def analyze_real(candles, expiry, pair_type, data_source="smart", candles_dict=N
     direction = "BUY" if net_score >= 0 else "SELL"
     total_score = buy_score + sell_score
 
-    # حساب الثقة
     if total_score > 0:
         ratio = max(buy_score, sell_score) / total_score
         base_conf = 50 + (ratio - 0.5) * 90
@@ -476,33 +615,20 @@ def analyze_real(candles, expiry, pair_type, data_source="smart", candles_dict=N
     if atr > 0:
         base_conf += min(atr / (current_price * 0.001), 3) * 2
 
-    # تقليل الثقة في السوق الجانبي
     if trend == "sideways":
         base_conf = min(base_conf, 70)
 
-    # رفع الثقة لو المؤشرات كلها متفقة
     if abs(net_score) < 3:
         base_conf = min(base_conf, 65)
     elif abs(net_score) > 15:
         base_conf = min(base_conf + 5, 96)
 
-    if data_source in ["yahoo", "pocket_option"]:
-        base_conf = min(base_conf + 3, 96)
-
-    # رفع الثقة لو MTF متفق
     if mtf_score != 0 and ((mtf_score > 0) == (net_score > 0)):
         base_conf = min(base_conf + 4, 96)
 
     confidence = min(96, max(55, int(base_conf)))
     arrow = "⬆️" if direction == "BUY" else "⬇️"
 
-    source_labels = {
-        "pocket_option": "🟢 Pocket Option (Live OTC)",
-        "yahoo": "📡 Yahoo Finance (Live)",
-        "smart": "🧠 Smart Analysis",
-    }
-
-    # فلتر: إذا الثقة أقل من 60% لا نعطي إشارة قوية
     if confidence < 63:
         direction = "WAIT ⏳"
         arrow = "⏳"
@@ -514,24 +640,8 @@ def analyze_real(candles, expiry, pair_type, data_source="smart", candles_dict=N
         "rsi": rsi, "stoch": stoch, "wr": wr, "cci": cci, "atr": atr,
         "price": current_price, "trend": trend,
         "buy_score": round(buy_score, 1), "sell_score": round(sell_score, 1),
-        "source": source_labels.get(data_source, "🧠 Smart Analysis"),
+        "source": "📡 Yahoo Finance (Live)",
     }
-
-def analyze_smart(pair_name, expiry, pair_type):
-    now = datetime.now()
-    seed = sum(ord(c) for c in f"{pair_name}{expiry}{now.hour}{now.minute // 2}{now.second // 15}")
-    random.seed(seed)
-    np.random.seed(seed % (2**31))
-    base = 1.1000
-    candles = []
-    for _ in range(80):
-        o = base + np.random.normal(0, 0.0008)
-        c = o + np.random.normal(0, 0.0006)
-        h = max(o, c) + abs(np.random.normal(0, 0.0003))
-        l = min(o, c) - abs(np.random.normal(0, 0.0003))
-        candles.append({"open": o, "close": c, "high": h, "low": l})
-        base = c
-    return analyze_real(candles, expiry, pair_type, data_source="smart")
 
 def get_entry_time(expiry):
     utc3 = timezone(timedelta(hours=3))
@@ -601,17 +711,110 @@ def find_pair(text):
             return pair
     return None
 
+# ===== SSID Manager =====
+
+async def check_ssid_health(app):
+    global ssid_alert_sent, po_connected
+    while True:
+        await asyncio.sleep(60)
+        if not po_connected and not ssid_alert_sent:
+            ssid_alert_sent = True
+            try:
+                await app.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        "🔴 *تنبيه: انقطع اتصال Pocket Option*\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        "🕐 *الوقت:* " + datetime.now().strftime("%I:%M %p") + "\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        "📋 *لتجديد SSID:*\n"
+                        "1️⃣ افتح pocketoption.com\n"
+                        "2️⃣ سجل دخول\n"
+                        "3️⃣ افتح F12 > Network > WS\n"
+                        "4️⃣ ابحث عن سطر فيه `auth` وانسخه\n"
+                        "5️⃣ أرسل لي:\n"
+                        "`/update_ssid 42[\"auth\",{\"sessionToken\":\"xxx\",\"uid\":\"123\",\"lang\":\"en\"}]`"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send SSID alert: {e}")
+        elif po_connected and ssid_alert_sent:
+            ssid_alert_sent = False
+            try:
+                await app.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text="🟢 *تم استعادة اتصال Pocket Option* ✅",
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
+
+async def update_ssid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PO_SSID, ssid_last_updated, ssid_alert_sent
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *استخدام خاطئ*\n\n"
+            "أرسل الأمر كذا:\n"
+            "`/update_ssid 42[\"auth\",{\"sessionToken\":\"xxx\",\"uid\":\"123\",\"lang\":\"en\"}]`",
+            parse_mode="Markdown"
+        )
+        return
+    new_ssid = " ".join(context.args)
+    if not new_ssid.startswith("42") or "sessionToken" not in new_ssid:
+        await update.message.reply_text("❌ *صيغة SSID غير صحيحة*", parse_mode="Markdown")
+        return
+    try:
+        match = re.search(r'"sessionToken":"([^"]+)"', new_ssid)
+        uid_match = re.search(r'"uid":"([^"]+)"', new_ssid)
+        token = match.group(1)[:10] + "..." if match else "???"
+        uid = uid_match.group(1) if uid_match else "???"
+    except:
+        token, uid = "???", "???"
+    PO_SSID = new_ssid
+    ssid_last_updated = datetime.now()
+    ssid_alert_sent = False
+    await update.message.reply_text(
+        f"✅ *تم تحديث SSID بنجاح*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 *التوكن:* {token}\n"
+        f"👤 *UID:* {uid}\n"
+        f"🕐 *الوقت:* {datetime.now().strftime('%I:%M %p')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 جاري إعادة الاتصال...",
+        parse_mode="Markdown"
+    )
+    asyncio.create_task(po_background_connection())
+
+async def check_ssid_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ssid_last_updated, po_connected
+    time_since = datetime.now() - ssid_last_updated
+    hours = time_since.seconds // 3600
+    minutes = (time_since.seconds % 3600) // 60
+    status = "🟢 متصل" if po_connected else "🔴 منقطع"
+    await update.message.reply_text(
+        f"📊 *حالة SSID*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📡 *الحالة:* {status}\n"
+        f"🕐 *آخر تحديث:* منذ {hours}h {minutes}m\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{'✅ شغال' if po_connected else '⚠️ يحتاج تجديد'}\n\n"
+        f"للتجديد: `/update_ssid [الكود]`",
+        parse_mode="Markdown"
+    )
+
 # ===== هاندلرز =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = "🟢 متصل بـ Pocket Option" if po_connected else "🧠 وضع التحليل الذكي"
+    status = "🟢 متصل بـ Pocket Option" if po_connected else "🔴 جاري الاتصال بـ Pocket Option..."
     await update.message.reply_text(
         f"👋 *مرحباً في VaultFX AI Bot* 🤖\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 *الحالة:* {status}\n"
-        f"🟢 *OTC:* بيانات Pocket Option\n"
-        f"📡 *Live:* تحليل متعدد الإطارات الزمنية\n"
+        f"🟢 *OTC:* بيانات حقيقية من Pocket Option\n"
+        f"📡 *Live:* تحليل من Yahoo Finance\n"
         f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ *OTC لا يعطي إشارات وهمية أبداً*\n"
         f"اختر نوع السوق:",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
@@ -653,76 +856,116 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
 
     scan_msg = await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text="🔍 *جاري تحليل السوق...*",
+        text="🔍 *جاري سحب البيانات الحقيقية...*",
         parse_mode="Markdown"
     )
 
-    steps = [
-        "📡 *جاري سحب البيانات من 3 إطارات زمنية...*" if pair_type == "live" else "🟢 *جاري سحب بيانات OTC...*",
-        "📊 *تحليل RSI · EMA · MACD · Momentum...*",
-        "🔥 *فحص MTF · Williams%R · CCI · ATR...*",
-        "🎯 *توليد الإشارة النهائية...*",
-    ]
+    if pair_type == "otc":
+        steps = [
+            "🟢 *جاري الاتصال بـ Pocket Option...*",
+            "📊 *جاري سحب بيانات OTC الحية...*",
+            "🧠 *تحليل RSI · EMA · MACD · Bollinger...*",
+            "🔥 *فحص Stochastic · W%R · CCI · ATR...*",
+            "🎯 *توليد الإشارة النهائية...*",
+        ]
+    else:
+        steps = [
+            "📡 *جاري سحب البيانات من 3 إطارات زمنية...*",
+            "📊 *تحليل RSI · EMA · MACD · Momentum...*",
+            "🔥 *فحص MTF · Williams%R · CCI · ATR...*",
+            "🎯 *توليد الإشارة النهائية...*",
+        ]
 
-    # بدء سحب البيانات
     if pair_type == "live":
         candles_task = asyncio.create_task(fetch_yahoo_multi(pair["symbol"]))
     else:
         candles_task = None
 
     for step in steps:
-        await asyncio.sleep(0.9)
+        await asyncio.sleep(0.8)
         try:
             await scan_msg.edit_text(step, parse_mode="Markdown")
         except:
             pass
 
-    candles = None
-    candles_dict = None
-    data_source = "smart"
-
     if pair_type == "otc":
         candles = await fetch_po_candles(pair["symbol"], 80)
-        if candles and len(candles) >= 20:
-            data_source = "pocket_option"
+        if not candles or len(candles) < 20:
+            await scan_msg.delete()
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    f"⚠️ *لا توجد بيانات حقيقية كافية*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💱 {pair['flag']} *{pair_name}*\n"
+                    f"📡 *المصدر:* Pocket Option\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🔴 *الحالة:* {'متصل' if po_connected else 'جاري الاتصال...'}\n"
+                    f"📊 *البيانات:* {len(candles) if candles else 0} شمعة فقط\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"❌ *لا يمكن إعطاء إشارة بدون بيانات حقيقية*\n"
+                    f"🔄 حاول مرة أخرى بعد قليل"
+                ),
+                parse_mode="Markdown",
+                reply_markup=get_otc_keyboard()
+            )
+            return
+        result = analyze_otc(candles, expiry)
     else:
+        candles_dict = None
+        candles = None
         if candles_task:
             candles_dict = await candles_task
             if candles_dict:
-                # استخدم الإطار القصير للتحليل الرئيسي
                 candles = candles_dict.get("short") or candles_dict.get("medium")
-                if candles and len(candles) >= 20:
-                    data_source = "yahoo"
+        if not candles or len(candles) < 20:
+            await scan_msg.delete()
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    f"⚠️ *تعذر سحب البيانات من Yahoo Finance*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"💱 {pair['flag']} *{pair_name}*\n"
+                    f"🔄 حاول مرة أخرى بعد قليل"
+                ),
+                parse_mode="Markdown",
+                reply_markup=get_live_keyboard()
+            )
+            return
+        result = analyze_live(candles, expiry, candles_dict=candles_dict)
 
-    if candles and len(candles) >= 20:
-        result = analyze_real(candles, expiry, pair_type, data_source=data_source, candles_dict=candles_dict)
-    else:
-        result = analyze_smart(pair_name, expiry, pair_type)
+    try:
+        await scan_msg.delete()
+    except:
+        pass
 
     entry_time, candle_note = get_entry_time(expiry)
 
     vote_total = result['buy_score'] + result['sell_score']
-    bull_pct = int(result['buy_score'] / vote_total * 100) if vote_total > 0 else 50
-    bear_pct = 100 - bull_pct
+    if vote_total > 0:
+        bull_pct = int(result['buy_score'] / vote_total * 100)
+        bear_pct = 100 - bull_pct
+    else:
+        bull_pct, bear_pct = 50, 50
 
-    # إذا الإشارة WAIT
     if result['direction'] == "WAIT ⏳":
         final_text = (
-            f"⏳ *انتظر — السوق غير واضح*\n"
+            f"⏳ *انتظر — لا توجد إشارة قوية*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"💱 {pair['flag']} *{pair_name}*\n"
             f"⏱ *مدة الصفقة:* {expiry}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💯 *الثقة:* {result['confidence']}% — منخفضة\n"
-            f"📊 *الاتجاه:* غير محدد\n"
+            f"💯 *الثقة:* {result['confidence']}% — ضعيفة\n"
+            f"📊 *الاتجاه:* غير واضح\n"
+            f"📡 *المصدر:* {result['source']}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ _لا تدخل الصفقة الآن، انتظر إشارة أقوى_"
+            f"⚠️ *لا تدخل الصفقة الآن*\n"
+            f"🔄 انتظر إشارة أقوى"
         )
     else:
         signal_emoji = "🟢" if result['direction'] == "BUY" else "🔴"
         direction_ar = "شراء 🟢" if result['direction'] == "BUY" else "بيع 🔴"
         trend_ar = {"uptrend": "📈 صاعد", "downtrend": "📉 هابط", "sideways": "↔️ جانبي"}.get(result['trend'], "")
-
         mtf_text = "\n".join(result.get('mtf_signals', []))
         mtf_section = f"🕐 *MTF Analysis:*\n{mtf_text}\n━━━━━━━━━━━━━━━━━━\n" if mtf_text else ""
 
@@ -733,7 +976,7 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
             f"⏱ *مدة الصفقة:* {expiry}\n"
             f"🕐 *وقت الدخول:* {entry_time}\n"
             f"📌 *الدخول في:* {candle_note}\n"
-            f"📊 *الاتجاه:* {direction_ar}\n"
+            f"📊 *الإشارة:* {direction_ar}\n"
             f"📈 *الترند:* {trend_ar}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"💯 *الثقة:* {result['confidence']}%\n"
@@ -741,7 +984,8 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
             f"📡 *المصدر:* {result['source']}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{mtf_section}"
-            f"⚠️ _Trade at your own risk_"
+            f"⚠️ *Trade at your own risk*\n"
+            f"✅ *بيانات حقيقية 100%*"
         )
 
     keyboard = get_live_keyboard() if pair_type == "live" else get_otc_keyboard()
@@ -754,13 +998,16 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
 
 async def post_init(application):
     asyncio.create_task(po_background_connection())
+    asyncio.create_task(check_ssid_health(application))
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("update_ssid", update_ssid))
+    app.add_handler(CommandHandler("ssid_status", check_ssid_status))
     app.add_handler(CallbackQueryHandler(handle_expiry_selection, pattern="^expiry\\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 VaultFX AI Bot v6 — Multi-Timeframe Live Analysis")
+    print("🤖 VaultFX AI Bot — OTC Real Data Only | SSID Auto-Alert")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
