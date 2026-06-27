@@ -1,7 +1,7 @@
 import logging
 import asyncio
+import random
 import json
-import re
 import numpy as np
 import aiohttp
 import websockets
@@ -13,8 +13,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8754472585:AAGIX510vMHTRCTJaGVdnsjn8HjcPqq9-HQ"
-PO_SSID = 'PO_SSID = PO_SSID = '42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]'
-ADMIN_CHAT_ID = "6921641426"
+PO_SSID = 42["auth",{"sessionToken":"278ef5e23b1e207e7446ad5328594626","uid":"130213513","lang":"en"}]
 
 OTC_PAIRS = [
     {"name": "AED/CNY OTC", "flag": "🇦🇪", "type": "otc", "symbol": "AEDCNY_otc"},
@@ -44,11 +43,8 @@ LIVE_PAIRS = [
 
 ALL_PAIRS = OTC_PAIRS + LIVE_PAIRS
 
-# ===== Pocket Option Cache =====
 po_candles_cache = {}
 po_connected = False
-ssid_last_updated = datetime.now()
-ssid_alert_sent = False
 
 PO_WS_REGIONS = [
     "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
@@ -149,8 +145,6 @@ async def fetch_po_candles(symbol: str, count: int = 80):
         return candles[-count:]
     return None
 
-# ===== Yahoo Finance =====
-
 async def fetch_yahoo_multi(symbol: str):
     results = {}
     configs = [
@@ -191,8 +185,6 @@ async def fetch_yahoo_multi(symbol: str):
             except Exception as e:
                 logger.warning(f"Yahoo {interval} error: {e}")
     return results
-
-# ===== المؤشرات =====
 
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -657,8 +649,6 @@ def get_entry_time(expiry):
     hour_12 = hour % 12 or 12
     return f"{hour_12}:{entry.strftime('%M')} {period}", candle_note
 
-# ===== كيبوردات =====
-
 def get_main_keyboard():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📊 OTC Pairs"), KeyboardButton("💹 Live Market")],
@@ -689,326 +679,4 @@ def get_expiry_keyboard(pair_name, pair_type):
         keyboard = [
             [
                 InlineKeyboardButton("⚡ S5", callback_data=f"expiry|S5|{pair_name}|{pair_type}"),
-                InlineKeyboardButton("⚡ S10", callback_data=f"expiry|S10|{pair_name}|{pair_type}"),
-                InlineKeyboardButton("⚡ S15", callback_data=f"expiry|S15|{pair_name}|{pair_type}"),
-            ],
-            [
-                InlineKeyboardButton("⏱ M1", callback_data=f"expiry|M1|{pair_name}|{pair_type}"),
-                InlineKeyboardButton("⏱ M2", callback_data=f"expiry|M2|{pair_name}|{pair_type}"),
-            ],
-        ]
-    else:
-        keyboard = [[
-            InlineKeyboardButton("⏱ M1", callback_data=f"expiry|M1|{pair_name}|{pair_type}"),
-            InlineKeyboardButton("⏱ M2", callback_data=f"expiry|M2|{pair_name}|{pair_type}"),
-            InlineKeyboardButton("⏱ M5", callback_data=f"expiry|M5|{pair_name}|{pair_type}"),
-        ]]
-    return InlineKeyboardMarkup(keyboard)
-
-def find_pair(text):
-    for pair in ALL_PAIRS:
-        if pair["name"] in text:
-            return pair
-    return None
-
-# ===== SSID Manager =====
-
-async def check_ssid_health(app):
-    global ssid_alert_sent, po_connected
-    while True:
-        await asyncio.sleep(60)
-        if not po_connected and not ssid_alert_sent:
-            ssid_alert_sent = True
-            try:
-                await app.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=(
-                        "🔴 *تنبيه: انقطع اتصال Pocket Option*\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        "🕐 *الوقت:* " + datetime.now().strftime("%I:%M %p") + "\n"
-                        "━━━━━━━━━━━━━━━━━━\n"
-                        "📋 *لتجديد SSID:*\n"
-                        "1️⃣ افتح pocketoption.com\n"
-                        "2️⃣ سجل دخول\n"
-                        "3️⃣ افتح F12 > Network > WS\n"
-                        "4️⃣ ابحث عن سطر فيه `auth` وانسخه\n"
-                        "5️⃣ أرسل لي:\n"
-                        "`/update_ssid 42[\"auth\",{\"sessionToken\":\"xxx\",\"uid\":\"123\",\"lang\":\"en\"}]`"
-                    ),
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send SSID alert: {e}")
-        elif po_connected and ssid_alert_sent:
-            ssid_alert_sent = False
-            try:
-                await app.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text="🟢 *تم استعادة اتصال Pocket Option* ✅",
-                    parse_mode="Markdown"
-                )
-            except:
-                pass
-
-async def update_ssid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PO_SSID, ssid_last_updated, ssid_alert_sent
-    if not context.args:
-        await update.message.reply_text(
-            "❌ *استخدام خاطئ*\n\n"
-            "أرسل الأمر كذا:\n"
-            "`/update_ssid 42[\"auth\",{\"sessionToken\":\"xxx\",\"uid\":\"123\",\"lang\":\"en\"}]`",
-            parse_mode="Markdown"
-        )
-        return
-    new_ssid = " ".join(context.args)
-    if not new_ssid.startswith("42") or "sessionToken" not in new_ssid:
-        await update.message.reply_text("❌ *صيغة SSID غير صحيحة*", parse_mode="Markdown")
-        return
-    try:
-        match = re.search(r'"sessionToken":"([^"]+)"', new_ssid)
-        uid_match = re.search(r'"uid":"([^"]+)"', new_ssid)
-        token = match.group(1)[:10] + "..." if match else "???"
-        uid = uid_match.group(1) if uid_match else "???"
-    except:
-        token, uid = "???", "???"
-    PO_SSID = new_ssid
-    ssid_last_updated = datetime.now()
-    ssid_alert_sent = False
-    await update.message.reply_text(
-        f"✅ *تم تحديث SSID بنجاح*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 *التوكن:* {token}\n"
-        f"👤 *UID:* {uid}\n"
-        f"🕐 *الوقت:* {datetime.now().strftime('%I:%M %p')}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔄 جاري إعادة الاتصال...",
-        parse_mode="Markdown"
-    )
-    asyncio.create_task(po_background_connection())
-
-async def check_ssid_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ssid_last_updated, po_connected
-    time_since = datetime.now() - ssid_last_updated
-    hours = time_since.seconds // 3600
-    minutes = (time_since.seconds % 3600) // 60
-    status = "🟢 متصل" if po_connected else "🔴 منقطع"
-    await update.message.reply_text(
-        f"📊 *حالة SSID*\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📡 *الحالة:* {status}\n"
-        f"🕐 *آخر تحديث:* منذ {hours}h {minutes}m\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{'✅ شغال' if po_connected else '⚠️ يحتاج تجديد'}\n\n"
-        f"للتجديد: `/update_ssid [الكود]`",
-        parse_mode="Markdown"
-    )
-
-# ===== هاندلرز =====
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = "🟢 متصل بـ Pocket Option" if po_connected else "🔴 جاري الاتصال بـ Pocket Option..."
-    await update.message.reply_text(
-        f"👋 *مرحباً في VaultFX AI Bot* 🤖\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📡 *الحالة:* {status}\n"
-        f"🟢 *OTC:* بيانات حقيقية من Pocket Option\n"
-        f"📡 *Live:* تحليل من Yahoo Finance\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ *OTC لا يعطي إشارات وهمية أبداً*\n"
-        f"اختر نوع السوق:",
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🔙 رجوع":
-        await update.message.reply_text("🏠 القائمة الرئيسية:", reply_markup=get_main_keyboard())
-        return
-    if text == "📊 OTC Pairs":
-        await update.message.reply_text("📊 *OTC Pairs*", parse_mode="Markdown", reply_markup=get_otc_keyboard())
-        return
-    if text == "💹 Live Market":
-        await update.message.reply_text("💹 *Live Market*", parse_mode="Markdown", reply_markup=get_live_keyboard())
-        return
-    pair = find_pair(text)
-    if pair:
-        await update.message.reply_text(
-            f"{pair['flag']} *{pair['name']}*\n\n⏱ اختر وقت الصفقة:",
-            parse_mode="Markdown",
-            reply_markup=get_expiry_keyboard(pair['name'], pair['type'])
-        )
-        return
-    await update.message.reply_text("👆 اختر من الكيبورد:", reply_markup=get_main_keyboard())
-
-async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data.split("|")
-    expiry, pair_name, pair_type = data[1], data[2], data[3]
-    pair = find_pair(pair_name)
-    if not pair:
-        await query.edit_message_text("❌ خطأ، حاول مجددًا.")
-        return
-
-    await query.edit_message_text(f"{pair['flag']} *{pair_name}* — ⏱ {expiry}", parse_mode="Markdown")
-
-    scan_msg = await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text="🔍 *جاري سحب البيانات الحقيقية...*",
-        parse_mode="Markdown"
-    )
-
-    if pair_type == "otc":
-        steps = [
-            "🟢 *جاري الاتصال بـ Pocket Option...*",
-            "📊 *جاري سحب بيانات OTC الحية...*",
-            "🧠 *تحليل RSI · EMA · MACD · Bollinger...*",
-            "🔥 *فحص Stochastic · W%R · CCI · ATR...*",
-            "🎯 *توليد الإشارة النهائية...*",
-        ]
-    else:
-        steps = [
-            "📡 *جاري سحب البيانات من 3 إطارات زمنية...*",
-            "📊 *تحليل RSI · EMA · MACD · Momentum...*",
-            "🔥 *فحص MTF · Williams%R · CCI · ATR...*",
-            "🎯 *توليد الإشارة النهائية...*",
-        ]
-
-    if pair_type == "live":
-        candles_task = asyncio.create_task(fetch_yahoo_multi(pair["symbol"]))
-    else:
-        candles_task = None
-
-    for step in steps:
-        await asyncio.sleep(0.8)
-        try:
-            await scan_msg.edit_text(step, parse_mode="Markdown")
-        except:
-            pass
-
-    if pair_type == "otc":
-        candles = await fetch_po_candles(pair["symbol"], 80)
-        if not candles or len(candles) < 20:
-            await scan_msg.delete()
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=(
-                    f"⚠️ *لا توجد بيانات حقيقية كافية*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"💱 {pair['flag']} *{pair_name}*\n"
-                    f"📡 *المصدر:* Pocket Option\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🔴 *الحالة:* {'متصل' if po_connected else 'جاري الاتصال...'}\n"
-                    f"📊 *البيانات:* {len(candles) if candles else 0} شمعة فقط\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"❌ *لا يمكن إعطاء إشارة بدون بيانات حقيقية*\n"
-                    f"🔄 حاول مرة أخرى بعد قليل"
-                ),
-                parse_mode="Markdown",
-                reply_markup=get_otc_keyboard()
-            )
-            return
-        result = analyze_otc(candles, expiry)
-    else:
-        candles_dict = None
-        candles = None
-        if candles_task:
-            candles_dict = await candles_task
-            if candles_dict:
-                candles = candles_dict.get("short") or candles_dict.get("medium")
-        if not candles or len(candles) < 20:
-            await scan_msg.delete()
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=(
-                    f"⚠️ *تعذر سحب البيانات من Yahoo Finance*\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"💱 {pair['flag']} *{pair_name}*\n"
-                    f"🔄 حاول مرة أخرى بعد قليل"
-                ),
-                parse_mode="Markdown",
-                reply_markup=get_live_keyboard()
-            )
-            return
-        result = analyze_live(candles, expiry, candles_dict=candles_dict)
-
-    try:
-        await scan_msg.delete()
-    except:
-        pass
-
-    entry_time, candle_note = get_entry_time(expiry)
-
-    vote_total = result['buy_score'] + result['sell_score']
-    if vote_total > 0:
-        bull_pct = int(result['buy_score'] / vote_total * 100)
-        bear_pct = 100 - bull_pct
-    else:
-        bull_pct, bear_pct = 50, 50
-
-    if result['direction'] == "WAIT ⏳":
-        final_text = (
-            f"⏳ *انتظر — لا توجد إشارة قوية*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💱 {pair['flag']} *{pair_name}*\n"
-            f"⏱ *مدة الصفقة:* {expiry}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💯 *الثقة:* {result['confidence']}% — ضعيفة\n"
-            f"📊 *الاتجاه:* غير واضح\n"
-            f"📡 *المصدر:* {result['source']}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ *لا تدخل الصفقة الآن*\n"
-            f"🔄 انتظر إشارة أقوى"
-        )
-    else:
-        signal_emoji = "🟢" if result['direction'] == "BUY" else "🔴"
-        direction_ar = "شراء 🟢" if result['direction'] == "BUY" else "بيع 🔴"
-        trend_ar = {"uptrend": "📈 صاعد", "downtrend": "📉 هابط", "sideways": "↔️ جانبي"}.get(result['trend'], "")
-        mtf_text = "\n".join(result.get('mtf_signals', []))
-        mtf_section = f"🕐 *MTF Analysis:*\n{mtf_text}\n━━━━━━━━━━━━━━━━━━\n" if mtf_text else ""
-
-        final_text = (
-            f"{signal_emoji} *{result['direction']}*\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💱 {pair['flag']} *{pair_name}*\n"
-            f"⏱ *مدة الصفقة:* {expiry}\n"
-            f"🕐 *وقت الدخول:* {entry_time}\n"
-            f"📌 *الدخول في:* {candle_note}\n"
-            f"📊 *الإشارة:* {direction_ar}\n"
-            f"📈 *الترند:* {trend_ar}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💯 *الثقة:* {result['confidence']}%\n"
-            f"🗳 *التصويت:* 🟢 {bull_pct}% | 🔴 {bear_pct}%\n"
-            f"📡 *المصدر:* {result['source']}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"{mtf_section}"
-            f"⚠️ *Trade at your own risk*\n"
-            f"✅ *بيانات حقيقية 100%*"
-        )
-
-    keyboard = get_live_keyboard() if pair_type == "live" else get_otc_keyboard()
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=final_text,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-async def post_init(application):
-    asyncio.create_task(po_background_connection())
-    asyncio.create_task(check_ssid_health(application))
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("update_ssid", update_ssid))
-    app.add_handler(CommandHandler("ssid_status", check_ssid_status))
-    app.add_handler(CallbackQueryHandler(handle_expiry_selection, pattern="^expiry\\|"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 VaultFX AI Bot — OTC Real Data Only | SSID Auto-Alert")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+                InlineKeyboardButton("⚡ S10", callback_data=f"expiry|S10
