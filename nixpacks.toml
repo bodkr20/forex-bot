@@ -1,12 +1,11 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "python311Packages.virtualenv"]
+nixPkgs = ["python311", "python311Packages.pip"]
 
 [phases.install]
 cmds = [
-  "python -m venv venv",
-  ". venv/bin/activate",
-  "pip install python-telegram-bot==20.8 numpy aiohttp websockets requests pycryptodome pytz"
+  "pip install --break-system-packages --upgrade pip",
+  "pip install --break-system-packages python-telegram-bot==20.8 numpy aiohttp websockets requests pycryptodome pytz"
 ]
 
 [start]
-cmd = ". venv/bin/activate && python bot.py"
+cmd = "python bot.py"
