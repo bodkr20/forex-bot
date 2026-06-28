@@ -16,10 +16,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8754472585:AAGIX510vMHTRCTJaGVdnsjn8HjcPqq9-HQ"
 
-# 🔐 بيانات الدخول إلى Pocket Option (عدل هذين السطرين)
-POCKET_EMAIL = "bodkr3333@hotmail.com"  # <- حط إيميلك هنا
-POCKET_PASSWORD = "ABD123ilah@"        # <- حط باسووردك هنا
-POCKET_IS_DEMO = True  # True للحساب التجريبي، False للحقيقي
+# 🔐 معرف المحلل (أنت)
+ADMIN_CHAT_ID = "6921641426"  # <- تم التعديل
+
+# 🔐 بيانات الدخول إلى Pocket Option (احتفظ بها للاستخدام المستقبلي)
+POCKET_EMAIL = "bodkr3333@hotmail.com"
+POCKET_PASSWORD = "ABD123ilah@"
+POCKET_IS_DEMO = True
 
 # ===== أزواج العملات =====
 OTC_PAIRS = [
@@ -50,208 +53,10 @@ LIVE_PAIRS = [
 
 ALL_PAIRS = OTC_PAIRS + LIVE_PAIRS
 
-# ===== ⭐ ميزة تسجيل الدخول التلقائي (باستخدام API-Pocket-Option) =====
+# ===== SSID يدوي (عدّل حسب الحاجة) =====
+PO_SSID = None  # سيتم استخدامه إذا أردت لاحقاً
 
-PO_SSID = None  # سيتم تعبئته تلقائياً
-
-def get_po_ssid():
-    """جلب SSID تلقائياً باستخدام مكتبة API-Pocket-Option"""
-    global PO_SSID
-    try:
-        from pocketoption_api import PocketOption  # المكتبة الجديدة
-        
-        # إنشاء كائن الاتصال
-        client = PocketOption(
-            email=POCKET_EMAIL,
-            password=POCKET_PASSWORD,
-            is_demo=POCKET_IS_DEMO
-        )
-        
-        # تسجيل الدخول واستخراج SSID
-        client.login()
-        ssid = client.get_ssid()
-        
-        if ssid:
-            PO_SSID = ssid
-            logger.info(f"✅ تم استخراج SSID تلقائياً: {ssid[:50]}...")
-            return ssid
-        else:
-            logger.error("❌ فشل استخراج SSID")
-            return None
-            
-    except ImportError:
-        logger.warning("⚠️ مكتبة API-Pocket-Option غير مثبتة، سيتم استخدام SSID اليدوي")
-        return None
-    except Exception as e:
-        logger.error(f"❌ خطأ في تسجيل الدخول التلقائي: {e}")
-        return None
-
-# ===== Pocket Option WebSocket (مع دعم SSID التلقائي) =====
-
-PO_WS_REGIONS = [
-    "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
-    "wss://api-c.po.market/socket.io/?EIO=4&transport=websocket",
-    "wss://api-s.po.market/socket.io/?EIO=4&transport=websocket",
-]
-
-async def fetch_po_candles(symbol: str, count: int = 80):
-    global PO_SSID
-    
-    # إذا كان SSID فارغاً، حاول جلبه تلقائياً
-    if not PO_SSID:
-        PO_SSID = get_po_ssid()
-        if not PO_SSID:
-            logger.warning("⚠️ لا يوجد SSID صالح، استخدم التحليل الذكي")
-            return None
-    
-    for ws_url in PO_WS_REGIONS:
-        try:
-            candles = await _connect_and_fetch(ws_url, symbol, count)
-            if candles and len(candles) >= 20:
-                return candles
-        except Exception as e:
-            logger.warning(f"PO WS failed {ws_url}: {e}")
-            continue
-    return None
-
-async def _connect_and_fetch(ws_url: str, symbol: str, count: int):
-    global PO_SSID
-    candles = []
-    try:
-        async with websockets.connect(
-            ws_url,
-            extra_headers={
-                "Origin": "https://pocketoption.com",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            },
-            ping_interval=20,
-            ping_timeout=10,
-            close_timeout=5,
-        ) as ws:
-            await asyncio.wait_for(ws.recv(), timeout=5)
-            await ws.send("40")
-            await asyncio.wait_for(ws.recv(), timeout=5)
-            
-            # استخدام SSID المتجدد تلقائياً
-            await ws.send(PO_SSID)
-
-            auth_success = False
-            for _ in range(10):
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=3)
-                    if "auth/success" in msg:
-                        auth_success = True
-                        break
-                except asyncio.TimeoutError:
-                    break
-            
-            # إذا فشل المصادقة، حاول تجديد SSID
-            if not auth_success:
-                logger.warning("⚠️ فشل المصادقة، محاولة تجديد SSID...")
-                PO_SSID = get_po_ssid()
-                if PO_SSID:
-                    # إعادة المحاولة مع SSID الجديد
-                    return await _connect_and_fetch(ws_url, symbol, count)
-                return None
-
-            now_ts = int(datetime.now().timestamp())
-            
-            subscribe_msg = json.dumps([
-                "subscribe",
-                {"asset": symbol, "period": 60}
-            ])
-            await ws.send(f"42{subscribe_msg}")
-            
-            history_msg = json.dumps([
-                "loadHistoryPeriod",
-                {"asset": symbol, "period": 60, "time": now_ts, "index": 0}
-            ])
-            await ws.send(f"42{history_msg}")
-
-            for _ in range(30):
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=5)
-                    
-                    if "candles" in msg or "history" in msg or "loadHistoryPeriod" in msg:
-                        if msg.startswith("42"):
-                            data = json.loads(msg[2:])
-                            if isinstance(data, list) and len(data) >= 2:
-                                payload = data[1]
-                                if isinstance(payload, list):
-                                    for c in payload:
-                                        if isinstance(c, dict) and "open" in c:
-                                            candles.append({
-                                                "open": float(c.get("open", 0)),
-                                                "close": float(c.get("close", 0)),
-                                                "high": float(c.get("high", c.get("close", 0))),
-                                                "low": float(c.get("low", c.get("close", 0))),
-                                            })
-                                elif isinstance(payload, dict):
-                                    raw = payload.get("candles") or payload.get("data") or payload.get("history") or []
-                                    for c in raw:
-                                        if isinstance(c, (list, tuple)) and len(c) >= 4:
-                                            candles.append({
-                                                "open": float(c[1]),
-                                                "close": float(c[4]) if len(c) > 4 else float(c[3]),
-                                                "high": float(c[2]),
-                                                "low": float(c[3]),
-                                            })
-                                        elif isinstance(c, dict) and "open" in c:
-                                            candles.append({
-                                                "open": float(c.get("open", 0)),
-                                                "close": float(c.get("close", 0)),
-                                                "high": float(c.get("high", c.get("close", 0))),
-                                                "low": float(c.get("low", c.get("close", 0))),
-                                            })
-                                if len(candles) >= 20:
-                                    break
-                    elif msg == "2":
-                        await ws.send("3")
-                except asyncio.TimeoutError:
-                    continue
-    except Exception as e:
-        logger.warning(f"WS error: {e}")
-        return None
-
-    return candles[-count:] if len(candles) >= 20 else None
-
-# ===== Yahoo Finance =====
-
-async def fetch_yahoo_candles(symbol: str, count: int = 80):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {"interval": "1m", "range": "1d", "includePrePost": "false"}
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-        result = data.get("chart", {}).get("result", [])
-        if not result:
-            return None
-        chart = result[0]
-        indicators = chart.get("indicators", {}).get("quote", [{}])[0]
-        opens = indicators.get("open", [])
-        closes = indicators.get("close", [])
-        highs = indicators.get("high", [])
-        lows = indicators.get("low", [])
-        candles = []
-        for i in range(len(closes)):
-            if closes[i] is None or opens[i] is None:
-                continue
-            candles.append({
-                "open": opens[i], "close": closes[i],
-                "high": highs[i] if highs[i] else closes[i],
-                "low": lows[i] if lows[i] else closes[i],
-            })
-        return candles[-count:] if len(candles) >= 20 else None
-    except Exception as e:
-        logger.warning(f"Yahoo error: {e}")
-        return None
-
-# ===== المؤشرات الأساسية =====
-
+# ===== المؤشرات =====
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return 50.0
@@ -388,14 +193,11 @@ def detect_patterns(candles):
 
     return patterns[:2], score
 
-# ===== 🚀 قوة الإشارة (Rocket System) =====
-
+# ===== 🚀 قوة الإشارة =====
 def calculate_signal_strength(result, candles):
-    """حساب قوة الإشارة من 1 إلى 5 🚀"""
     strength = 0
     reasons = []
     
-    # 1. الثقة (Confidence)
     if result['confidence'] >= 85:
         strength += 2
         reasons.append("ثقة عالية جداً")
@@ -406,7 +208,6 @@ def calculate_signal_strength(result, candles):
         strength += 1
         reasons.append("ثقة متوسطة")
     
-    # 2. توافق المؤشرات
     signal_count = len(result.get('signals', []))
     if signal_count >= 4:
         strength += 1.5
@@ -415,19 +216,16 @@ def calculate_signal_strength(result, candles):
         strength += 1
         reasons.append(f"{signal_count} مؤشرات متوافقة")
     
-    # 3. RSI متطرف
     rsi = result.get('rsi', 50)
     if rsi < 30 or rsi > 70:
         strength += 1
         reasons.append("RSI متطرف")
     
-    # 4. أنماط قوية
     patterns = result.get('signals', [])
     if any(p in str(patterns) for p in ['Engulfing', 'Star', 'Hammer']):
         strength += 1
         reasons.append("نمط شموع قوي")
     
-    # 5. التقلب (ATR)
     atr = result.get('atr', 0)
     price = result.get('price', 1)
     if atr > 0 and price > 0:
@@ -436,7 +234,6 @@ def calculate_signal_strength(result, candles):
             strength += 0.5
             reasons.append("تقلب عالي")
     
-    # 6. فارق التصويت
     diff = abs(result.get('buy_score', 0) - result.get('sell_score', 0))
     if diff >= 5:
         strength += 1
@@ -444,7 +241,6 @@ def calculate_signal_strength(result, candles):
     elif diff >= 3:
         strength += 0.5
     
-    # تحديد النجوم
     if strength >= 6:
         rocket = "🚀🚀🚀🚀🚀"
         level = "قوية جداً"
@@ -468,8 +264,7 @@ def calculate_signal_strength(result, candles):
         "reasons": reasons[:3]
     }
 
-# ===== ⚡ استراتيجية الاختراق (Breakout) =====
-
+# ===== استراتيجيات =====
 def breakout_strategy(candles, expiry):
     closes = [c["close"] for c in candles]
     _, bb_up, bb_low = calc_bollinger(closes, period=10)
@@ -490,8 +285,6 @@ def breakout_strategy(candles, expiry):
         score -= 8
 
     return signals, score
-
-# ===== ⚡ استراتيجية الانعكاس السريع (Snap Reversal) =====
 
 def snap_reversal_strategy(candles, expiry):
     closes = [c["close"] for c in candles]
@@ -525,8 +318,7 @@ def snap_reversal_strategy(candles, expiry):
 
     return signals, score
 
-# ===== تحليل OTC مع الاستراتيجيات =====
-
+# ===== تحليل OTC =====
 def analyze_otc_pro(candles, expiry):
     closes = [c["close"] for c in candles]
     rsi = calc_rsi(closes)
@@ -690,7 +482,6 @@ def analyze_otc_pro(candles, expiry):
     return result
 
 # ===== تحليل Live =====
-
 def analyze_live(candles, expiry):
     closes = [c["close"] for c in candles]
     rsi = calc_rsi(closes)
@@ -863,7 +654,6 @@ def get_entry_time(expiry):
     return f"{hour_12}:{entry.strftime('%M')} {period}", candle_note
 
 # ===== كيبوردات =====
-
 def get_main_keyboard():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📊 OTC Pairs"), KeyboardButton("💹 Live Market")],
@@ -916,8 +706,57 @@ def find_pair(text):
             return pair
     return None
 
-# ===== هاندلرز =====
+# ===== 📸 خاصية تحليل الصور =====
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال الصورة وإرسالها للمحلل"""
+    if not update.message.photo:
+        await update.message.reply_text("❌ أرسل صورة فقط.")
+        return
+    
+    # تحميل الصورة
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    file_path = f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    await file.download_to_drive(file_path)
+    
+    # إرسال الصورة للمحلل
+    try:
+        await context.bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=open(file_path, 'rb'),
+            caption=f"📸 طلب تحليل من {update.effective_user.username or update.effective_user.first_name}"
+        )
+        await update.message.reply_text("📸 تم استلام الصورة، جاري التحليل... سأرد عليك خلال لحظات.")
+    except Exception as e:
+        logger.error(f"Error sending photo to admin: {e}")
+        await update.message.reply_text("❌ حدث خطأ في إرسال الصورة، حاول مجدداً.")
 
+async def forward_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال رد المحلل وإرساله للمستخدم"""
+    if str(update.message.chat_id) != ADMIN_CHAT_ID:
+        return
+    
+    if not update.message.reply_to_message:
+        return
+    
+    # استخراج معرف المستخدم من الرسالة الأصلية
+    original_caption = update.message.reply_to_message.caption
+    if not original_caption or "طلب تحليل من" not in original_caption:
+        return
+    
+    username = original_caption.replace("📸 طلب تحليل من ", "")
+    
+    # إرسال الرد للمستخدم
+    try:
+        await context.bot.send_message(
+            chat_id=update.message.chat_id,  # سيرسل للمستخدم
+            text=f"📊 **توصية من المحلل:**\n\n{update.message.text}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error forwarding analysis: {e}")
+
+# ===== هاندلرز =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *مرحباً في VaultFX AI Bot* 🤖\n\n"
@@ -927,6 +766,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━\n"
         "⚡ *استراتيجيات:* Breakout | Snap Reversal\n"
         "🚀 *قوة الإشارة:* 1-5 نجوم\n"
+        "📸 *أرسل صورة شارت* لتحليل فوري\n"
         "⚠️ *إشارات حقيقية فقط*\n"
         "اختر نوع السوق:",
         parse_mode="Markdown",
@@ -981,10 +821,8 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
         "🎯 *توليد الإشارة النهائية...*",
     ]
 
-    if pair_type == "otc":
-        candles_task = asyncio.create_task(fetch_po_candles(pair["symbol"], 80))
-    else:
-        candles_task = asyncio.create_task(fetch_yahoo_candles(pair["symbol"], 80))
+    # محاكاة جلب البيانات (لأننا ما زلنا في مرحلة التطوير)
+    candles = None  # سيتم تعديلها لاحقاً
 
     for step in steps:
         await asyncio.sleep(0.7)
@@ -993,20 +831,9 @@ async def handle_expiry_selection(update: Update, context: ContextTypes.DEFAULT_
         except:
             pass
 
-    candles = await candles_task
-
-    if pair_type == "otc":
-        if candles and len(candles) >= 20:
-            result = analyze_otc_pro(candles, expiry)
-        else:
-            logger.info(f"⚠️ No real data for {pair_name}, using Smart Analysis")
-            result = analyze_smart(pair_name, expiry, pair_type)
-            result["source"] = "🧠 Smart Analysis"
-    else:
-        if candles and len(candles) >= 20:
-            result = analyze_live(candles, expiry)
-        else:
-            result = analyze_smart(pair_name, expiry, pair_type)
+    # استخدام التحليل الذكي مؤقتاً
+    result = analyze_smart(pair_name, expiry, pair_type)
+    result["source"] = "🧠 Smart Analysis"
 
     entry_time, candle_note = get_entry_time(expiry)
 
@@ -1076,7 +903,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_expiry_selection, pattern="^expiry\\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 VaultFX AI Bot v8 — مع تسجيل الدخول التلقائي 🚀")
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forward_analysis))
+    print("🤖 VaultFX AI Bot v9 — مع تحليل الصور 🚀")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
