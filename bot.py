@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 # Configuration
-BOT_TOKEN = ("8836603799:AAGBn5P1SZlU6WggqEi8-0GSxEntMCXLzQQ")
+BOT_TOKEN = ("8836603799:AAHP9dZVD-rtRSz_4B7Odqf3j2tlhLlR2C8")
 MAKKAH_TZ = pytz.timezone("Asia/Riyadh")
 
 logging.basicConfig(
