@@ -1,7 +1,5 @@
-python-telegram-bot==20.7
+python-telegram-bot==20.8
 numpy==1.26.4
-aiohttp==3.9.5
-websockets==12.0
-requests==2.32.3
-pycryptodome==3.20.0
+pandas==1.5.3
+yfinance==0.2.38
 pytz==2024.1
