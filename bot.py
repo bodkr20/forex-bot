@@ -66,30 +66,38 @@ MAIN_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# تقليل الحد الأدنى المطلوب لتجنب الرفض الفني عند نقص الشموع في السوق الحقيقي
-MIN_BARS_REQUIRED = 30 
+# تقليل الحد الأدنى المطلوب لتجنب الرفض الفني
+MIN_BARS_REQUIRED = 15 
 
-# دالة جلب بيانات معدلة ومقاومة للأخطاء ومشاكل ياهو فايننس اللحظية
 def _fetch_ohlc_sync(ticker: str) -> pd.DataFrame | None:
-    try:
-        # المحاولة الأولى: جلب بيانات 5 أيام بفاصل دقيقة واحدة لجلب أكبر قدر من الشموع
-        df = yf.download(ticker, period="5d", interval="1m", progress=False, show_errors=False, threads=False, auto_adjust=True)
-        if df is not None and not df.empty and len(df) >= MIN_BARS_REQUIRED:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df.dropna()
-        
-        # المحاولة الثانية كخيار احتياطي (Fallback) في حال فشل الفاصل الزمني الصغير
-        df_backup = yf.download(ticker, period="7d", interval="2m", progress=False, show_errors=False, threads=False, auto_adjust=True)
-        if df_backup is not None and not df_backup.empty:
-            if isinstance(df_backup.columns, pd.MultiIndex):
-                df_backup.columns = df_backup.columns.get_level_values(0)
-            return df_backup.dropna()
+    attempts = [
+        {"period": "1d", "interval": "1m"},  # محاولة 1: يوم واحد دقيقة واحدة (خفيف ومستقر جداً)
+        {"period": "2d", "interval": "2m"},  # محاولة 2: يومين بفاصل دقيقتين
+        {"period": "5d", "interval": "5m"},  # محاولة 3: 5 أيام بفاصل 5 دقائق
+    ]
+    
+    for attempt in attempts:
+        try:
+            logger.info(f"Trying to fetch {ticker} with period={attempt['period']} interval={attempt['interval']}")
+            df = yf.download(
+                ticker, 
+                period=attempt["period"], 
+                interval=attempt["interval"], 
+                progress=False, 
+                show_errors=False, 
+                threads=False, 
+                auto_adjust=True
+            )
+            if df is not None and not df.empty and len(df) >= MIN_BARS_REQUIRED:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                logger.info(f"Successfully fetched {len(df)} rows for {ticker}")
+                return df.dropna()
+        except Exception as exc:
+            logger.warning(f"Attempt failed for {ticker} ({attempt}): {exc}")
+            continue
             
-        return None
-    except Exception as exc:
-        logger.error("yfinance fetch failed for %s: %s", ticker, exc)
-        return None
+    return None
 
 async def fetch_ohlc(ticker: str) -> pd.DataFrame | None:
     return await asyncio.to_thread(_fetch_ohlc_sync, ticker)
@@ -97,13 +105,11 @@ async def fetch_ohlc(ticker: str) -> pd.DataFrame | None:
 # تحسين خوارزمية جلب الـ OTC لتعطي نتائج وتوقعات دقيقة مبنية على اتجاهات حقيقية
 def generate_otc_data(strategy_type: str) -> pd.DataFrame:
     np.random.seed(random.randint(0, 100000))
-    count = 100 # زيادة الشموع لضمان دقة المؤشرات الفنية للـ OTC
+    count = 100 
     close_prices = [1.2500]
     
-    # دمج آلية حركة الاتجاه ومستويات الدعم والمقاومة لرفع دقة الاستراتيجيات اللحظية
     trend_bias = 0.0006 if strategy_type == "breakout" else -0.0004
     for i in range(count - 1):
-        # إضافة عامل موجة جيبية (Sine wave) لمنع الحركات العشوائية غير الواقعية وتطابق سلوك الشارت
         wave = 0.0008 * np.sin(i * 0.15)
         movement = np.random.normal(trend_bias, 0.0009) + wave
         close_prices.append(close_prices[-1] + movement)
@@ -159,7 +165,6 @@ class SignalResult:
         self.strength_stars = ""
         self.active_strategy = "General Quant"
 
-# Signal Engine incorporating Snap Reversal and Breakout Strategy Rules
 def analyze(df: pd.DataFrame, is_otc: bool = False) -> SignalResult:
     result = SignalResult()
     if df is None or len(df) < MIN_BARS_REQUIRED:
@@ -175,11 +180,9 @@ def analyze(df: pd.DataFrame, is_otc: bool = False) -> SignalResult:
     stoch_k, stoch_d = stochastic(df, 14, 3, 3)
     atr = true_range_atr(df, 14)
 
-    # Strategy Scanner Activation
     strategy_activated = "General Quant Engine"
     strategy_score = 0.0
     
-    # 1. Snap Reversal Strategy Detection
     if rsi14.iloc[-1] <= 28 or stoch_k.iloc[-1] <= 18:
         strategy_activated = "🔄 Snap Reversal Strategy"
         strategy_score = 1.3  
@@ -187,7 +190,6 @@ def analyze(df: pd.DataFrame, is_otc: bool = False) -> SignalResult:
         strategy_activated = "🔄 Snap Reversal Strategy"
         strategy_score = -1.3
 
-    # 2. Breakout Strategy Detection
     if hist.iloc[-1] > 0 and hist.iloc[-2] <= 0 and ema5.iloc[-1] > ema13.iloc[-1]:
         strategy_activated = "⚡ Breakout Expansion Strategy"
         strategy_score = 1.4
@@ -197,7 +199,6 @@ def analyze(df: pd.DataFrame, is_otc: bool = False) -> SignalResult:
 
     result.active_strategy = strategy_activated
 
-    # Mathematical Weights Calculations
     score_ema_fast = 1.0 if ema5.iloc[-1] > ema13.iloc[-1] else -1.0
     score_ema_trend = 1.0 if ema9.iloc[-1] > ema21.iloc[-1] else -1.0
     
@@ -224,14 +225,12 @@ def analyze(df: pd.DataFrame, is_otc: bool = False) -> SignalResult:
     if strategy_score != 0.0:
         weighted_score = max(-1.0, min(1.0, (weighted_score + strategy_score) / 2))
 
-    # فحص الفولتية والتأكد من تلافي القيم الصفرية
     current_atr = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) else 0.0001
     if current_atr <= 0 and not is_otc:
         result.rejected = True
         result.reject_reason = "No volatility detected in active timeframe asset pools."
         return result
 
-    # تقليل نسبة الفلترة لضمان خروج الإشارات وتفادي Rejection المستمر
     if abs(weighted_score) < 0.10 and not is_otc:
         result.rejected = True
         result.reject_reason = "Indicators conflicting. Weak mathematical edge."
@@ -270,7 +269,21 @@ def build_signal_message(pair_key: str, expiry: str, result: SignalResult) -> st
             f"📡 *Source:* Smart Engine 🧠"
         )
 
-    execution = "الشمعة القادمة ⏭" if now_makkah.second >= 42 else "الشمعة الحالية ▶️"
+    # منطق ذكي لتحديد وقت الدخول بناءً على نوع الاستراتيجية والوقت الحالي للشمعة
+    current_second = now_makkah.second
+    is_breakout = "Breakout" in result.active_strategy
+    is_reversal = "Reversal" in result.active_strategy
+
+    if current_second >= 40:
+        execution = "الشمعة القادمة ⏭ (انتظار الإغلاق لتجنب انعكاس الوقت)"
+    else:
+        if is_breakout:
+            execution = "ادخل الآن فوراً 🔥 (دخول سريع مع زخم الاختراق)"
+        elif is_reversal:
+            execution = "ادخل مع الشمعة القادمة 🔄 (انتظار تأكيد الارتداد)"
+        else:
+            execution = "ادخل الآن ▶️ (الشمعة الحالية)"
+
     direction_label = "BUY 🟢" if result.direction == "BUY" else "SELL 🔴"
     signal_ar = "شراء 🟢" if result.direction == "BUY" else "بيع 🔴"
     trend_ar = "صاعد 📈" if result.trend_up else "هابط 📉"
